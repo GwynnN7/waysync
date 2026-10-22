@@ -65,11 +65,11 @@ When an environment (e.g., `caelestia` or `noctalia`) is active, waysync resolve
 
 1. **Single File (`src = "starship.toml"`):** waysync checks if `overrides/<env>/starship.toml` exists. If found, it deploys that override; otherwise, it falls back to `dotfiles/starship.toml`.
 2. **Directory (`src = "hypr"`):** waysync scans `dotfiles/hypr/` first and then merges `overrides/<env>/hypr/` over it. Files are selected by relative path—so `overrides/noctalia/hypr/hyprland.conf` replaces `dotfiles/hypr/hyprland.conf`, while base-only and override-only files are both deployed.
-3. **Switching Environments:** Running `waysync env` uninstalls packages and undeploys files belonging to the old environment, installs the new environment's components, re-deploys global components with the new overrides, and removes files that no longer apply.
+3. **Switching Environments:** Running `waysync env` uninstalls packages and undeploys files belonging to the old environment, installs the new environment's components, and updates only enabled global components whose effective files or environment-scoped hooks change. Unrelated global components are not re-deployed. An affected component with `ask = true` still requires confirmation before it is updated.
 
 ### Per-file Environment Scope
 
-Use `environment` on an individual `[[components.files]]` entry when a component has both shared files and files that should exist only in one environment. Entries without it deploy in every environment; a tagged entry deploys only while its named environment is active. On an environment change, Waysync re-deploys enabled global components and removes files that no longer apply.
+Use `environment` on an individual `[[components.files]]` entry when a component has both shared files and files that should exist only in one environment. Entries without it deploy in every environment; a tagged entry deploys only while its named environment is active. On an environment change, Waysync updates affected enabled global components and removes files that no longer apply.
 
 This scope applies only to a file entry. Packages and hooks remain component-level; keep those in an environment-specific component when they must not run or install globally.
 
@@ -87,7 +87,7 @@ available = ["caelestia", "noctalia"]
 name = "hypr"                          # Unique component identifier
 category = "wm"                        # Menu category (defaults to "general")
 default = true                         # Checked by default on first run (default: false)
-ask = true                             # Ask before re-deploying an installed component (default: false)
+ask = true                             # Ask before updating an installed component (default: false)
 environment = "caelestia"              # Optional: bind component to a specific environment
 packages = [
     "hyprland",                        # Native Arch or AUR package (installed via paru)

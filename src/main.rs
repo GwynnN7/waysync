@@ -453,16 +453,79 @@ fn enabled_environment_components_require_sudo(
         .any(|component| component_requires_sudo(component, Some(environment)))
 }
 
-fn enabled_global_components_require_sudo(
-    manifest: &Manifest,
-    state: &State,
-    active_env: Option<&str>,
+/// Whether switching environments changes a global component's effective deployment.
+///
+/// Global components without environment-scoped entries or overrides have identical
+/// inputs before and after the switch, so they must be left alone. Updating them here
+/// turns a shell/environment switch into an implicit repository-wide sync.
+fn global_component_is_affected_by_environment_change(
+    component: &manifest::Component,
+    config: &AppConfig,
+    old_env: Option<&str>,
+    new_env: Option<&str>,
 ) -> bool {
-    manifest
-        .components
+    let files_are_affected = component.files.iter().any(|file| {
+        if file.applies_to_environment(old_env) != file.applies_to_environment(new_env) {
+            return true;
+        }
+
+        // A repository source is independent from an environment. For local sources,
+        // an override in either environment changes the resolved source (or directory
+        // merge) and therefore needs to be re-deployed.
+        file.applies_to_environment(new_env)
+            && !file.src.starts_with("repo:")
+            && [old_env, new_env]
+                .into_iter()
+                .flatten()
+                .any(|environment| config.override_dir(environment).join(&file.src).exists())
+    });
+
+    let activates_environment_hook = component
+        .post_install
         .iter()
-        .filter(|component| component.environment.is_none() && state.is_enabled(&component.name))
-        .any(|component| component_deployment_requires_sudo(component, active_env))
+        .chain(component.post_deploy.iter())
+        .any(|hook| hook.environment().is_some() && hook.applies_to_environment(new_env));
+
+    files_are_affected || activates_environment_hook
+}
+
+/// Keep `ask = true` meaningful during an environment change too. Components that
+/// are unaffected never reach this prompt.
+fn confirm_environment_component_updates<'a>(
+    components: Vec<&'a manifest::Component>,
+    state: &State,
+) -> Vec<&'a manifest::Component> {
+    components
+        .into_iter()
+        .filter(|component| {
+            let already_installed = state.is_enabled(&component.name)
+                || state.deployed.contains_key(&component.name);
+            if !component.ask || !already_installed {
+                return true;
+            }
+
+            match menu::confirm_component_update(&component.name) {
+                Ok(true) => true,
+                Ok(false) => {
+                    println!(
+                        "  {} Skipping optional environment update for {}.",
+                        style("→").dim(),
+                        style(&component.name).yellow()
+                    );
+                    false
+                }
+                Err(error) => {
+                    eprintln!(
+                        "  {} Could not ask about {}: {}",
+                        style("!").yellow(),
+                        component.name,
+                        error
+                    );
+                    false
+                }
+            }
+        })
+        .collect()
 }
 
 fn apply_changes(
@@ -674,8 +737,24 @@ fn change_environment(
         .as_ref()
         .map(|selection| selection_requires_sudo(manifest, selection, new_env))
         .unwrap_or(false);
-    let global_components_require_sudo =
-        enabled_global_components_require_sudo(manifest, state, new_env);
+    let global_to_update: Vec<_> = manifest
+        .components
+        .iter()
+        .filter(|component| {
+            component.environment.is_none()
+                && state.is_enabled(&component.name)
+                && global_component_is_affected_by_environment_change(
+                    component,
+                    config,
+                    old_env.as_deref(),
+                    new_env,
+                )
+        })
+        .collect();
+    let global_to_update = confirm_environment_component_updates(global_to_update, state);
+    let global_components_require_sudo = global_to_update
+        .iter()
+        .any(|component| component_deployment_requires_sudo(component, new_env));
     let _sudo_session = (old_environment_requires_sudo
         || new_selection_requires_sudo
         || global_components_require_sudo)
@@ -735,22 +814,8 @@ fn change_environment(
         apply_changes(config, manifest, state, sel)?;
     }
 
-    let global_to_update: Vec<_> = manifest
-        .components
-        .iter()
-        .filter(|c| {
-            c.environment.is_none()
-                && state.is_enabled(&c.name)
-                && (!c.files.is_empty()
-                    || c.post_install
-                        .iter()
-                        .any(|h| h.environment() == new_env && new_env.is_some())
-                    || !c.post_deploy.is_empty())
-        })
-        .collect();
-
     if !global_to_update.is_empty() {
-        println!("\n  Re-deploying global components for new environment overrides...");
+        println!("\n  Updating global components affected by the environment change...");
         for comp in global_to_update {
             println!(
                 "  {} {} (override update)",
@@ -800,4 +865,97 @@ fn ensure_initialized(config: &AppConfig) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn test_config() -> (AppConfig, std::path::PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "waysync-environment-change-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        let config = AppConfig {
+            state_dir: root.join("state"),
+            data_dir: root.join("data"),
+            repo_dir: root.join("repo"),
+            state_file: root.join("state/state.toml"),
+        };
+        (config, root)
+    }
+
+    #[test]
+    fn only_global_components_changed_by_environment_are_selected_for_update() {
+        let (config, root) = test_config();
+        let new_override = config.override_dir("noctalia").join("theme.toml");
+        std::fs::create_dir_all(new_override.parent().expect("override directory")).unwrap();
+        std::fs::write(new_override, "noctalia theme").unwrap();
+
+        let manifest: Manifest = toml::from_str(
+            r#"
+            [[components]]
+            name = "plain"
+            [[components.files]]
+            src = "plain.toml"
+            dest = "~/.config/plain.toml"
+
+            [[components]]
+            name = "overridden"
+            [[components.files]]
+            src = "theme.toml"
+            dest = "~/.config/theme.toml"
+
+            [[components]]
+            name = "scoped-file"
+            [[components.files]]
+            src = "shell.conf"
+            dest = "~/.config/shell.conf"
+            environment = "caelestia"
+
+            [[components]]
+            name = "new-environment-hook"
+            post_deploy = [{ cmd = "reload", environment = "noctalia" }]
+
+            [[components]]
+            name = "old-environment-hook"
+            post_deploy = [{ cmd = "reload", environment = "caelestia" }]
+
+            [[components]]
+            name = "external-repo"
+            [[components.files]]
+            src = "repo:owner/repository"
+            dest = "~/.config/repository"
+            "#,
+        )
+        .unwrap();
+
+        let affected: Vec<_> = manifest
+            .components
+            .iter()
+            .filter(|component| {
+                global_component_is_affected_by_environment_change(
+                    component,
+                    &config,
+                    Some("caelestia"),
+                    Some("noctalia"),
+                )
+            })
+            .map(|component| component.name.as_str())
+            .collect();
+
+        assert_eq!(
+            affected,
+            vec!["overridden", "scoped-file", "new-environment-hook"]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

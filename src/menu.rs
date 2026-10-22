@@ -61,10 +61,10 @@ pub fn show_completion(term: &Term, title: &str, message: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ask whether an already installed optional component should be deployed now.
+/// Ask whether an already installed optional component should be updated now.
 pub fn confirm_component_update(component: &str) -> Result<bool> {
     Confirm::new()
-        .with_prompt(format!("Deploy optional component '{}' now?", component))
+        .with_prompt(format!("Update optional component '{}' now?", component))
         .default(false)
         .interact()
         .map_err(Into::into)
