@@ -385,16 +385,27 @@ pub fn install_packages(packages: &[String], repo_path: &Path, needed: bool) -> 
 
     // 3. Local PKGBUILD packages (`local:<name>`) built via `paru -Ui`
     for name in local {
+        let pkg_dir = repo_path.join("packages").join(&name);
+        if !pkg_dir.exists() {
+            bail!("Local package directory not found: {}", pkg_dir.display());
+        }
+
         if needed && !local_package_needs_build(repo_path, &name)? {
             continue;
         }
 
-        let pkg_dir = repo_path.join("packages").join(&name);
         let label = format!("local:{}", name);
         println!("  Building local package: {}", name);
 
-        let auto_args = vec!["-Ui".to_string(), "--noconfirm".to_string()];
-        let interactive_args = vec!["-Ui".to_string()];
+        let mut base_args = vec!["-Ui".to_string()];
+        if !needed {
+            base_args.push("--rebuild".to_string());
+        }
+
+        let mut auto_args = base_args.clone();
+        auto_args.push("--noconfirm".to_string());
+
+        let interactive_args = base_args;
 
         run_with_interactive_fallback(
             &label,

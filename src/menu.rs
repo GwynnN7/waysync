@@ -7,8 +7,11 @@ use dialoguer::Confirm;
 use crate::manifest::{Component, Manifest};
 use crate::state::State;
 
+#[derive(Clone, Copy)]
 pub enum MainMenuAction {
     ManageComponents,
+    SyncSpecific,
+    UninstallSpecific,
     ChangeEnvironment,
     UpdateRepo,
     Status,
@@ -19,11 +22,21 @@ pub struct ComponentSelection {
     pub enabled: Vec<String>,
     pub disabled: Vec<String>,
     pub reinstall: bool,
+    pub skip_ask: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionMode {
+    /// Full declarative state: pre-selects enabled/default; unchecked items are uninstalled.
+    Declarative,
+    /// Targeted sync/install: starts empty; only selected items are synced, nothing is uninstalled.
+    SyncSpecific,
+    /// Targeted uninstall: starts empty; only selected items are uninstalled, nothing is synced.
+    UninstallSpecific,
 }
 
 /// Clear visible screen, scrollback buffer, and print a clean TUI header.
 pub fn render_header(term: &Term, subtitle: &str) -> Result<()> {
-    // \x1b[2J = clear screen, \x1b[3J = clear scrollback buffer, \x1b[H = cursor to top-left
     print!("\x1b[2J\x1b[3J\x1b[H");
     term.flush()?;
     println!(
@@ -86,11 +99,19 @@ fn main_menu_loop(
 ) -> Result<MainMenuAction> {
     let has_envs = manifest.environments.is_some();
 
-    let mut items = vec!["📦 Manage Components"];
+    let mut entries: Vec<(&str, MainMenuAction)> = vec![
+        ("📦 Manage Components", MainMenuAction::ManageComponents),
+        ("⚡ Install Components", MainMenuAction::SyncSpecific),
+        ("🗑️ Uninstall Components", MainMenuAction::UninstallSpecific),
+    ];
     if has_envs {
-        items.push("🖥️ Change Environment");
+        entries.push(("🖥️ Change Environment", MainMenuAction::ChangeEnvironment));
     }
-    items.extend_from_slice(&["🔄 Update Repository", "📊 Status", "🚪 Exit"]);
+    entries.extend_from_slice(&[
+        ("🔄 Update Repository", MainMenuAction::UpdateRepo),
+        ("📊 Status", MainMenuAction::Status),
+        ("🚪 Exit", MainMenuAction::Exit),
+    ]);
 
     let mut cursor = 0;
 
@@ -102,18 +123,18 @@ fn main_menu_loop(
             println!("  Environment: {}\n", style(env_label).cyan().bold());
         }
 
-        for (i, item) in items.iter().enumerate() {
+        for (i, (label, _)) in entries.iter().enumerate() {
             let prefix = if i == cursor {
                 style("❯").cyan().bold()
             } else {
                 style(" ").dim()
             };
-            let label = if i == cursor {
-                style(*item).cyan().bold()
+            let styled_label = if i == cursor {
+                style(*label).cyan().bold()
             } else {
-                style(*item)
+                style(*label)
             };
-            println!("  {} {}", prefix, label);
+            println!("  {} {}", prefix, styled_label);
         }
 
         println!(
@@ -123,28 +144,13 @@ fn main_menu_loop(
 
         match term.read_key()? {
             Key::ArrowUp | Key::Char('k') => {
-                cursor = if cursor == 0 { items.len() - 1 } else { cursor - 1 };
+                cursor = if cursor == 0 { entries.len() - 1 } else { cursor - 1 };
             }
             Key::ArrowDown | Key::Char('j') => {
-                cursor = (cursor + 1) % items.len();
+                cursor = (cursor + 1) % entries.len();
             }
             Key::Enter | Key::ArrowRight | Key::Char('l') => {
-                if has_envs {
-                    return Ok(match cursor {
-                        0 => MainMenuAction::ManageComponents,
-                        1 => MainMenuAction::ChangeEnvironment,
-                        2 => MainMenuAction::UpdateRepo,
-                        3 => MainMenuAction::Status,
-                        _ => MainMenuAction::Exit,
-                    });
-                } else {
-                    return Ok(match cursor {
-                        0 => MainMenuAction::ManageComponents,
-                        1 => MainMenuAction::UpdateRepo,
-                        2 => MainMenuAction::Status,
-                        _ => MainMenuAction::Exit,
-                    });
-                }
+                return Ok(entries[cursor].1);
             }
             Key::Escape | Key::Char('q') => return Ok(MainMenuAction::Exit),
             _ => {}
@@ -152,12 +158,34 @@ fn main_menu_loop(
     }
 }
 
-/// Interactive Categories & Components TUI.
-/// - Space on a category enables all (if none/partial) or disables all (if all enabled).
-/// - Enter on a category opens the component checkboxes directly.
+/// Full declarative component management menu.
 pub fn show_components_menu(
     components: &[&Component],
     state: &State,
+) -> Result<Option<ComponentSelection>> {
+    run_components_menu(components, state, SelectionMode::Declarative)
+}
+
+/// Targeted component sync/install menu (starts with nothing selected; does not uninstall unselected).
+pub fn show_sync_specific_menu(
+    components: &[&Component],
+    state: &State,
+) -> Result<Option<ComponentSelection>> {
+    run_components_menu(components, state, SelectionMode::SyncSpecific)
+}
+
+/// Targeted component uninstall menu (starts with nothing selected; only uninstalls selected).
+pub fn show_uninstall_menu(
+    components: &[&Component],
+    state: &State,
+) -> Result<Option<ComponentSelection>> {
+    run_components_menu(components, state, SelectionMode::UninstallSpecific)
+}
+
+fn run_components_menu(
+    components: &[&Component],
+    state: &State,
+    mode: SelectionMode,
 ) -> Result<Option<ComponentSelection>> {
     if components.is_empty() {
         return Ok(None);
@@ -165,7 +193,7 @@ pub fn show_components_menu(
 
     let term = Term::stdout();
     let _ = term.hide_cursor();
-    let res = components_menu_loop(&term, components, state);
+    let res = components_menu_loop(&term, components, state, mode);
     let _ = term.show_cursor();
     res
 }
@@ -174,6 +202,7 @@ fn components_menu_loop(
     term: &Term,
     components: &[&Component],
     state: &State,
+    mode: SelectionMode,
 ) -> Result<Option<ComponentSelection>> {
     let mut category_order: Vec<String> = Vec::new();
     let mut by_category: HashMap<String, Vec<&Component>> = HashMap::new();
@@ -186,30 +215,40 @@ fn components_menu_loop(
         by_category.entry(cat).or_default().push(comp);
     }
 
-    let mut enabled_set: HashSet<String> = HashSet::new();
-    for comp in components {
-        let is_on = state
-            .components
-            .get(&comp.name)
-            .copied()
-            .unwrap_or(comp.default);
-        if is_on {
-            enabled_set.insert(comp.name.clone());
+    let mut selected_set: HashSet<String> = HashSet::new();
+    if mode == SelectionMode::Declarative {
+        for comp in components {
+            let is_on = state
+                .components
+                .get(&comp.name)
+                .copied()
+                .unwrap_or(comp.default);
+            if is_on {
+                selected_set.insert(comp.name.clone());
+            }
         }
     }
 
+    let show_reinstall = mode != SelectionMode::UninstallSpecific;
     let mut reinstall = false;
     let mut cursor = 0;
-    let total_rows = category_order.len() + 2; // Categories + Reinstall + Save
+    let action_rows = if show_reinstall { 2 } else { 1 };
+    let total_rows = category_order.len() + action_rows;
+
+    let header_title = match mode {
+        SelectionMode::Declarative => "Manage Components",
+        SelectionMode::SyncSpecific => "Install Components",
+        SelectionMode::UninstallSpecific => "Uninstall Components",
+    };
 
     loop {
-        render_header(term, "Manage Components")?;
+        render_header(term, header_title)?;
 
         for (i, cat) in category_order.iter().enumerate() {
             let comps = &by_category[cat];
-            let enabled_count = comps
+            let selected_count = comps
                 .iter()
-                .filter(|c| enabled_set.contains(&c.name))
+                .filter(|c| selected_set.contains(&c.name))
                 .count();
             let total_count = comps.len();
 
@@ -220,12 +259,25 @@ fn components_menu_loop(
                 style(" ").dim()
             };
 
-            let checkbox = if enabled_count == total_count {
-                style("[✓]").green().bold()
-            } else if enabled_count > 0 {
-                style("[~]").yellow().bold()
-            } else {
-                style("[ ]").dim()
+            let checkbox = match mode {
+                SelectionMode::UninstallSpecific => {
+                    if selected_count == total_count {
+                        style("[✗]").red().bold()
+                    } else if selected_count > 0 {
+                        style("[~]").yellow().bold()
+                    } else {
+                        style("[ ]").dim()
+                    }
+                }
+                _ => {
+                    if selected_count == total_count {
+                        style("[✓]").green().bold()
+                    } else if selected_count > 0 {
+                        style("[~]").yellow().bold()
+                    } else {
+                        style("[ ]").dim()
+                    }
+                }
             };
 
             let cat_name = if is_selected {
@@ -234,45 +286,63 @@ fn components_menu_loop(
                 style(format!("{:<15}", cat))
             };
 
-            let count_badge = style(format!("({}/{})", enabled_count, total_count)).dim();
+            let count_badge = style(format!("({}/{})", selected_count, total_count)).dim();
 
             println!("  {} {} 📁 {} {}", pointer, checkbox, cat_name, count_badge);
         }
 
         println!();
 
-        // Action 1: Reinstall toggle
-        let reinstall_idx = category_order.len();
-        let p_reinstall = if cursor == reinstall_idx {
-            style("❯").cyan().bold()
+        let (reinstall_idx, save_idx) = if show_reinstall {
+            let r_idx = category_order.len();
+            let p_reinstall = if cursor == r_idx {
+                style("❯").cyan().bold()
+            } else {
+                style(" ").dim()
+            };
+            let c_reinstall = if reinstall {
+                style("[✓]").yellow().bold()
+            } else {
+                style("[ ]").dim()
+            };
+            let l_reinstall = if cursor == r_idx {
+                style("Reinstall").yellow().bold()
+            } else {
+                style("Reinstall").yellow()
+            };
+            println!("  {} {} {}", p_reinstall, c_reinstall, l_reinstall);
+            (Some(r_idx), category_order.len() + 1)
         } else {
-            style(" ").dim()
+            (None, category_order.len())
         };
-        let c_reinstall = if reinstall {
-            style("[✓]").yellow().bold()
-        } else {
-            style("[ ]").dim()
-        };
-        let l_reinstall = if cursor == reinstall_idx {
-            style("Reinstall")
-                .yellow()
-                .bold()
-        } else {
-            style("Reinstall").yellow()
-        };
-        println!("  {} {} {}", p_reinstall, c_reinstall, l_reinstall);
 
-        // Action 2: Save & Apply
-        let save_idx = category_order.len() + 1;
         let p_save = if cursor == save_idx {
             style("❯").cyan().bold()
         } else {
             style(" ").dim()
         };
-        let l_save = if cursor == save_idx {
-            style("💾 Save & Apply").green().bold()
-        } else {
-            style("💾 Save & Apply").green()
+        let l_save = match mode {
+            SelectionMode::Declarative => {
+                if cursor == save_idx {
+                    style("💾 Save & Apply").green().bold()
+                } else {
+                    style("💾 Save & Apply").green()
+                }
+            }
+            SelectionMode::SyncSpecific => {
+                if cursor == save_idx {
+                    style("⚡ Install Selected").green().bold()
+                } else {
+                    style("⚡ Install Selected").green()
+                }
+            }
+            SelectionMode::UninstallSpecific => {
+                if cursor == save_idx {
+                    style("🗑️ Uninstall Selected").red().bold()
+                } else {
+                    style("🗑️ Uninstall Selected").red()
+                }
+            }
         };
         println!("  {} {}", p_save, l_save);
 
@@ -293,17 +363,17 @@ fn components_menu_loop(
                 if cursor < category_order.len() {
                     let cat = &category_order[cursor];
                     let comps = &by_category[cat];
-                    let all_enabled = comps.iter().all(|c| enabled_set.contains(&c.name));
-                    if all_enabled {
+                    let all_selected = comps.iter().all(|c| selected_set.contains(&c.name));
+                    if all_selected {
                         for comp in comps {
-                            enabled_set.remove(&comp.name);
+                            selected_set.remove(&comp.name);
                         }
                     } else {
                         for comp in comps {
-                            enabled_set.insert(comp.name.clone());
+                            selected_set.insert(comp.name.clone());
                         }
                     }
-                } else if cursor == reinstall_idx {
+                } else if Some(cursor) == reinstall_idx {
                     reinstall = !reinstall;
                 }
             }
@@ -311,24 +381,61 @@ fn components_menu_loop(
                 if cursor < category_order.len() {
                     let cat = &category_order[cursor];
                     let comps = &by_category[cat];
-                    category_components_loop(term, cat, comps, &mut enabled_set)?;
-                } else if cursor == reinstall_idx {
+                    category_components_loop(term, cat, comps, state, &mut selected_set, mode)?;
+                } else if Some(cursor) == reinstall_idx {
                     reinstall = !reinstall;
                 } else if cursor == save_idx {
-                    let mut enabled = Vec::new();
-                    let mut disabled = Vec::new();
-                    for comp in components {
-                        if enabled_set.contains(&comp.name) {
-                            enabled.push(comp.name.clone());
-                        } else {
-                            disabled.push(comp.name.clone());
+                    match mode {
+                        SelectionMode::Declarative => {
+                            let mut enabled = Vec::new();
+                            let mut disabled = Vec::new();
+                            for comp in components {
+                                if selected_set.contains(&comp.name) {
+                                    enabled.push(comp.name.clone());
+                                } else {
+                                    disabled.push(comp.name.clone());
+                                }
+                            }
+                            return Ok(Some(ComponentSelection {
+                                enabled,
+                                disabled,
+                                reinstall,
+                                skip_ask: false,
+                            }));
+                        }
+                        SelectionMode::SyncSpecific => {
+                            let enabled: Vec<String> = components
+                                .iter()
+                                .filter(|c| selected_set.contains(&c.name))
+                                .map(|c| c.name.clone())
+                                .collect();
+                            if enabled.is_empty() {
+                                return Ok(None);
+                            }
+                            return Ok(Some(ComponentSelection {
+                                enabled,
+                                disabled: Vec::new(),
+                                reinstall,
+                                skip_ask: true,
+                            }));
+                        }
+                        SelectionMode::UninstallSpecific => {
+                            let disabled: Vec<String> = components
+                                .iter()
+                                .filter(|c| selected_set.contains(&c.name))
+                                .map(|c| c.name.clone())
+                                .collect();
+                            if disabled.is_empty() {
+                                return Ok(None);
+                            }
+                            return Ok(Some(ComponentSelection {
+                                enabled: Vec::new(),
+                                disabled,
+                                reinstall: false,
+                                skip_ask: false,
+                            }));
                         }
                     }
-                    return Ok(Some(ComponentSelection {
-                        enabled,
-                        disabled,
-                        reinstall,
-                    }));
                 } else {
                     return Ok(None);
                 }
@@ -344,7 +451,9 @@ fn category_components_loop(
     term: &Term,
     category: &str,
     comps: &[&Component],
-    enabled_set: &mut HashSet<String>,
+    state: &State,
+    selected_set: &mut HashSet<String>,
+    mode: SelectionMode,
 ) -> Result<()> {
     let mut cursor = 0;
     let total_rows = comps.len();
@@ -354,7 +463,7 @@ fn category_components_loop(
 
         for (i, comp) in comps.iter().enumerate() {
             let is_selected = i == cursor;
-            let is_enabled = enabled_set.contains(&comp.name);
+            let is_checked = selected_set.contains(&comp.name);
 
             let pointer = if is_selected {
                 style("❯").cyan().bold()
@@ -362,10 +471,21 @@ fn category_components_loop(
                 style(" ").dim()
             };
 
-            let checkbox = if is_enabled {
-                style("[✓]").green().bold()
-            } else {
-                style("[ ]").dim()
+            let checkbox = match mode {
+                SelectionMode::UninstallSpecific => {
+                    if is_checked {
+                        style("[✗]").red().bold()
+                    } else {
+                        style("[ ]").dim()
+                    }
+                }
+                _ => {
+                    if is_checked {
+                        style("[✓]").green().bold()
+                    } else {
+                        style("[ ]").dim()
+                    }
+                }
             };
 
             let name = if is_selected {
@@ -387,7 +507,18 @@ fn category_components_loop(
             ))
             .dim();
 
-            println!("  {} {} {}{}{}", pointer, checkbox, name, env_tag, meta);
+            let installed_badge = if mode == SelectionMode::SyncSpecific
+                && (state.is_enabled(&comp.name) || state.deployed.contains_key(&comp.name))
+            {
+                format!(" {}", style("[installed]").green().dim())
+            } else {
+                String::new()
+            };
+
+            println!(
+                "  {} {} {}{}{}{}",
+                pointer, checkbox, name, env_tag, meta, installed_badge
+            );
         }
 
         println!(
@@ -404,21 +535,21 @@ fn category_components_loop(
             }
             Key::Char(' ') => {
                 let name = &comps[cursor].name;
-                if enabled_set.contains(name) {
-                    enabled_set.remove(name);
+                if selected_set.contains(name) {
+                    selected_set.remove(name);
                 } else {
-                    enabled_set.insert(name.clone());
+                    selected_set.insert(name.clone());
                 }
             }
             Key::Char('a') => {
-                let all_enabled = comps.iter().all(|c| enabled_set.contains(&c.name));
-                if all_enabled {
+                let all_selected = comps.iter().all(|c| selected_set.contains(&c.name));
+                if all_selected {
                     for comp in comps {
-                        enabled_set.remove(&comp.name);
+                        selected_set.remove(&comp.name);
                     }
                 } else {
                     for comp in comps {
-                        enabled_set.insert(comp.name.clone());
+                        selected_set.insert(comp.name.clone());
                     }
                 }
             }
