@@ -65,7 +65,7 @@ When an environment (e.g., `caelestia` or `noctalia`) is active, waysync resolve
 
 1. **Single File (`src = "starship.toml"`):** waysync checks if `overrides/<env>/starship.toml` exists. If found, it deploys that override; otherwise, it falls back to `dotfiles/starship.toml`.
 2. **Directory (`src = "hypr"`):** waysync scans `dotfiles/hypr/` first and then merges `overrides/<env>/hypr/` over it. Files are selected by relative path—so `overrides/noctalia/hypr/hyprland.conf` replaces `dotfiles/hypr/hyprland.conf`, while base-only and override-only files are both deployed.
-3. **Switching Environments:** Running `waysync env` uninstalls packages and undeploys files belonging to the old environment, installs the new environment's components, and updates only enabled global components whose effective files or environment-scoped hooks change. Unrelated global components are not re-deployed. An affected component with `ask = true` still requires confirmation before it is updated.
+3. **Switching Environments:** Running `waysync env` removes only old-environment packages that are not claimed by another enabled component, without recursively removing their dependencies; it also undeploys old files, installs the new environment's components, and updates only enabled global components whose effective files or environment-scoped hooks change. Unrelated global components are not re-deployed. An affected component with `ask = true` still requires confirmation before it is updated.
 
 ### Per-file Environment Scope
 

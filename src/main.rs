@@ -319,18 +319,28 @@ fn sync_enabled_components(
 
 fn collect_retained_packages(
     manifest: &Manifest,
+    repo_path: &std::path::Path,
     active_env: Option<&str>,
     enabled_names: &HashSet<&str>,
 ) -> HashSet<String> {
     let mut retained = HashSet::new();
     for comp in manifest.components_for_environment(active_env) {
         if enabled_names.contains(comp.name.as_str()) {
-            for pkg in &comp.packages {
-                retained.insert(pkg.clone());
-            }
+            retained.extend(packages::package_names_for_specs(&comp.packages, repo_path));
         }
     }
     retained
+}
+
+fn component_packages_not_retained(
+    component: &manifest::Component,
+    repo_path: &std::path::Path,
+    retained_packages: &HashSet<String>,
+) -> Vec<String> {
+    packages::package_names_for_specs(&component.packages, repo_path)
+        .into_iter()
+        .filter(|package| !retained_packages.contains(package))
+        .collect()
 }
 
 use std::os::unix::fs::PermissionsExt;
@@ -641,8 +651,12 @@ fn apply_changes(
         final_enabled.insert(name.as_str());
     }
 
-    let retained_pkgs =
-        collect_retained_packages(manifest, active_env.as_deref(), &final_enabled);
+    let retained_pkgs = collect_retained_packages(
+        manifest,
+        &config.repo_dir,
+        active_env.as_deref(),
+        &final_enabled,
+    );
 
     for name in &selection.disabled {
         let was_deployed = state.is_enabled(name) || state.deployed.contains_key(name);
@@ -653,14 +667,10 @@ fn apply_changes(
                     style("[-]").red().bold(),
                     style(&comp.name).red()
                 );
-                let pkgs_to_remove: Vec<String> = comp
-                    .packages
-                    .iter()
-                    .filter(|p| !retained_pkgs.contains(*p))
-                    .cloned()
-                    .collect();
+                let pkgs_to_remove =
+                    component_packages_not_retained(comp, &config.repo_dir, &retained_pkgs);
                 if !pkgs_to_remove.is_empty() {
-                    packages::uninstall_packages(&pkgs_to_remove, &config.repo_dir)?;
+                    packages::uninstall_package_names(&pkgs_to_remove, true)?;
                 }
                 deploy::undeploy_component_files(comp, state)?;
             }
@@ -826,7 +836,12 @@ fn change_environment(
             new_active_names.insert(name.as_str());
         }
     }
-    let retained_pkgs = collect_retained_packages(manifest, new_env, &new_active_names);
+    let retained_pkgs = collect_retained_packages(
+        manifest,
+        &config.repo_dir,
+        new_env,
+        &new_active_names,
+    );
 
     if let Some(ref old) = old_env {
         let old_components: Vec<_> = manifest
@@ -842,14 +857,10 @@ fn change_environment(
                 comp.name,
                 old
             );
-            let pkgs_to_remove: Vec<String> = comp
-                .packages
-                .iter()
-                .filter(|p| !retained_pkgs.contains(*p))
-                .cloned()
-                .collect();
+            let pkgs_to_remove =
+                component_packages_not_retained(comp, &config.repo_dir, &retained_pkgs);
             if !pkgs_to_remove.is_empty() {
-                packages::uninstall_packages(&pkgs_to_remove, &config.repo_dir)?;
+                packages::uninstall_package_names(&pkgs_to_remove, false)?;
             }
             deploy::undeploy_component_files(comp, state)?;
         }
@@ -1004,5 +1015,36 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn environment_switch_retains_shared_packages_across_spec_types() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+            [[components]]
+            name = "still-enabled"
+            packages = ["aur:shared-package"]
+
+            [[components]]
+            name = "old-environment"
+            environment = "caelestia"
+            packages = ["shared-package", "old-only-package"]
+            "#,
+        )
+        .unwrap();
+        let (config, _root) = test_config();
+        let active_names = HashSet::from(["still-enabled"]);
+        let retained = collect_retained_packages(
+            &manifest,
+            &config.repo_dir,
+            Some("noctalia"),
+            &active_names,
+        );
+        let old_component = manifest.find_component("old-environment").unwrap();
+
+        assert_eq!(
+            component_packages_not_retained(old_component, &config.repo_dir, &retained),
+            vec!["old-only-package"]
+        );
     }
 }

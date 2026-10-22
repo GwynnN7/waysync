@@ -419,25 +419,43 @@ pub fn install_packages(packages: &[String], repo_path: &Path, needed: bool) -> 
     Ok(())
 }
 
-/// Uninstall packages. Silently skips packages that aren't installed.
-pub fn uninstall_packages(packages: &[String], repo_path: &Path) -> Result<()> {
+/// Resolve manifest package specs to the concrete package names managed by pacman.
+///
+/// This makes `foo`, `aur:foo`, and a local PKGBUILD that produces `foo` compare as
+/// the same package when deciding whether it is still needed by another component.
+pub fn package_names_for_specs(packages: &[String], repo_path: &Path) -> Vec<String> {
     let mut names = Vec::new();
     for spec in packages {
         match parse_package_spec(spec) {
             PackageSpec::Standard(name) | PackageSpec::Aur(name) => {
-                if is_exact_package_installed(&name) {
-                    names.push(name);
-                }
+                names.push(name);
             }
             PackageSpec::Local(dir_name) => {
-                for pkg in resolve_local_pkg_info(repo_path, &dir_name).names {
-                    if is_exact_package_installed(&pkg) {
-                        names.push(pkg);
-                    }
-                }
+                names.extend(resolve_local_pkg_info(repo_path, &dir_name).names);
             }
         }
     }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Uninstall concrete package names. Silently skips packages that aren't installed.
+///
+/// With `remove_orphaned_dependencies` disabled, pacman removes only the named
+/// packages. This is used during an environment change so one component's teardown
+/// cannot sweep dependencies that another enabled component still relies on.
+pub fn uninstall_package_names(
+    package_names: &[String],
+    remove_orphaned_dependencies: bool,
+) -> Result<()> {
+    let mut names: Vec<_> = package_names
+        .iter()
+        .filter(|name| is_exact_package_installed(name))
+        .cloned()
+        .collect();
+    names.sort();
+    names.dedup();
 
     if names.is_empty() {
         return Ok(());
@@ -446,15 +464,65 @@ pub fn uninstall_packages(packages: &[String], repo_path: &Path) -> Result<()> {
     let label = format!("uninstall ({})", names.join(", "));
     println!("  Uninstalling packages: {}", names.join(", "));
 
+    let removal_mode = removal_mode(remove_orphaned_dependencies);
     let mut auto_args = vec![
         "pacman".to_string(),
-        "-Rns".to_string(),
+        removal_mode.to_string(),
         "--noconfirm".to_string(),
     ];
     auto_args.extend(names.clone());
 
-    let mut interactive_args = vec!["pacman".to_string(), "-Rns".to_string()];
+    let mut interactive_args = vec!["pacman".to_string(), removal_mode.to_string()];
     interactive_args.extend(names);
 
     run_with_interactive_fallback(&label, "sudo", &auto_args, &interactive_args, None)
+}
+
+fn removal_mode(remove_orphaned_dependencies: bool) -> &'static str {
+    if remove_orphaned_dependencies {
+        "-Rns"
+    } else {
+        "-R"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{package_names_for_specs, removal_mode};
+
+    #[test]
+    fn local_specs_resolve_to_the_package_names_they_produce() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "waysync-package-spec-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        let package_dir = root.join("packages/theme");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("PKGBUILD"),
+            "pkgname=('shared-theme' 'theme-extra')\npkgver=1\npkgrel=1\narch=('any')\n",
+        )
+        .unwrap();
+
+        let names = package_names_for_specs(
+            &["aur:shared-theme".into(), "local:theme".into()],
+            &root,
+        );
+
+        assert_eq!(names, vec!["shared-theme", "theme-extra"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn environment_changes_do_not_request_recursive_dependency_removal() {
+        assert_eq!(removal_mode(false), "-R");
+        assert_eq!(removal_mode(true), "-Rns");
+    }
 }
