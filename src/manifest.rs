@@ -1,10 +1,41 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 fn default_true() -> bool {
     true
+}
+
+/// Accept the current list syntax as well as the previous single-value form so
+/// existing manifests continue to work after the scope model becomes plural.
+fn deserialize_environments<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(environment) => vec![environment],
+        OneOrMany::Many(environments) => environments,
+    })
+}
+
+fn applies_to_environments(environments: &[String], active_environment: Option<&str>) -> bool {
+    match active_environment {
+        Some(active_environment) => {
+            environments.is_empty()
+                || environments
+                    .iter()
+                    .any(|environment| environment == active_environment)
+        }
+        None => environments.is_empty(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,8 +60,13 @@ pub struct Component {
     pub default: bool,
     #[serde(default)]
     pub ask: bool,
-    #[serde(default, alias = "shell")]
-    pub environment: Option<String>,
+    #[serde(
+        default,
+        alias = "environment",
+        alias = "shell",
+        deserialize_with = "deserialize_environments"
+    )]
+    pub environments: Vec<String>,
     #[serde(default)]
     pub packages: Vec<String>,
     #[serde(default)]
@@ -49,9 +85,14 @@ pub struct FileEntry {
     pub sudo: bool,
     #[serde(default = "default_true")]
     pub check: bool,
-    /// Optional: only deploy this file when the given environment is active.
-    #[serde(default, alias = "shell")]
-    pub environment: Option<String>,
+    /// Optional: only deploy this file while one of these environments is active.
+    #[serde(
+        default,
+        alias = "environment",
+        alias = "shell",
+        deserialize_with = "deserialize_environments"
+    )]
+    pub environments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,8 +101,13 @@ pub enum HookEntry {
     Simple(String),
     Scoped {
         cmd: String,
-        #[serde(default, alias = "shell")]
-        environment: Option<String>,
+        #[serde(
+            default,
+            alias = "environment",
+            alias = "shell",
+            deserialize_with = "deserialize_environments"
+        )]
+        environments: Vec<String>,
     },
 }
 
@@ -73,18 +119,19 @@ impl HookEntry {
         }
     }
 
-    pub fn environment(&self) -> Option<&str> {
+    pub fn is_environment_scoped(&self) -> bool {
         match self {
-            HookEntry::Simple(_) => None,
-            HookEntry::Scoped { environment, .. } => environment.as_deref(),
+            HookEntry::Simple(_) => false,
+            HookEntry::Scoped { environments, .. } => !environments.is_empty(),
         }
     }
 
     pub fn applies_to_environment(&self, active_environment: Option<&str>) -> bool {
-        match (self.environment(), active_environment) {
-            (None, _) => true,
-            (Some(hook_env), Some(active_env)) => hook_env == active_env,
-            (Some(_), None) => false,
+        match self {
+            HookEntry::Simple(_) => true,
+            HookEntry::Scoped { environments, .. } => {
+                applies_to_environments(environments, active_environment)
+            }
         }
     }
 }
@@ -92,16 +139,24 @@ impl HookEntry {
 impl FileEntry {
     /// Whether this entry should be deployed for the currently active environment.
     ///
-    /// Entries without an environment are shared; entries with an environment are
-    /// deployed only when it exactly matches the active environment.
+    /// Entries without environments are shared; scoped entries are deployed only
+    /// when the active environment appears in their environment list.
     pub fn applies_to_environment(&self, active_environment: Option<&str>) -> bool {
-        match (&self.environment, active_environment) {
-            (None, _) => true,
-            (Some(file_environment), Some(active_environment)) => {
-                file_environment == active_environment
-            }
-            (Some(_), None) => false,
-        }
+        applies_to_environments(&self.environments, active_environment)
+    }
+}
+
+impl Component {
+    pub fn is_global(&self) -> bool {
+        self.environments.is_empty()
+    }
+
+    pub fn applies_to_environment(&self, active_environment: Option<&str>) -> bool {
+        applies_to_environments(&self.environments, active_environment)
+    }
+
+    pub fn environment_label(&self) -> Option<String> {
+        (!self.environments.is_empty()).then(|| self.environments.join(", "))
     }
 }
 
@@ -122,24 +177,20 @@ impl Manifest {
     }
 
     /// Returns components visible for the given active environment.
-    /// Global components (environment=None) are always visible.
-    /// Environment-specific components are only visible when their environment matches.
+    /// Global components are always visible. Environment-specific components are
+    /// visible when their environment list includes the active environment.
     pub fn components_for_environment(&self, env: Option<&str>) -> Vec<&Component> {
         self.components
             .iter()
-            .filter(|c| match (&c.environment, env) {
-                (None, _) => true,
-                (Some(ce), Some(e)) => ce == e,
-                (Some(_), None) => false,
-            })
+            .filter(|component| component.applies_to_environment(env))
             .collect()
     }
 
-    /// Returns ONLY the components bound to a specific environment.
+    /// Returns only non-global components whose environment list contains `env`.
     pub fn components_only_for_environment(&self, env: &str) -> Vec<&Component> {
         self.components
             .iter()
-            .filter(|c| c.environment.as_deref() == Some(env))
+            .filter(|component| !component.is_global() && component.applies_to_environment(Some(env)))
             .collect()
     }
 
@@ -152,31 +203,65 @@ impl Manifest {
 mod tests {
     use super::{FileEntry, Manifest};
 
-    fn file_entry(environment: Option<&str>) -> FileEntry {
+    fn file_entry(environments: &[&str]) -> FileEntry {
         FileEntry {
             src: "source".into(),
             dest: "destination".into(),
             sudo: false,
             check: true,
-            environment: environment.map(str::to_owned),
+            environments: environments.iter().map(ToString::to_string).collect(),
         }
     }
 
     #[test]
     fn unscoped_files_apply_to_every_environment() {
-        let entry = file_entry(None);
+        let entry = file_entry(&[]);
 
         assert!(entry.applies_to_environment(None));
         assert!(entry.applies_to_environment(Some("caelestia")));
     }
 
     #[test]
-    fn scoped_files_apply_only_to_their_environment() {
-        let entry = file_entry(Some("caelestia"));
+    fn scoped_files_apply_to_each_listed_environment() {
+        let entry = file_entry(&["caelestia", "noctalia"]);
 
         assert!(entry.applies_to_environment(Some("caelestia")));
-        assert!(!entry.applies_to_environment(Some("noctalia")));
+        assert!(entry.applies_to_environment(Some("noctalia")));
+        assert!(!entry.applies_to_environment(Some("kde")));
         assert!(!entry.applies_to_environment(None));
+    }
+
+    #[test]
+    fn components_and_hooks_accept_environment_lists() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+            [[components]]
+            name = "shared-environment-component"
+            environments = ["caelestia", "noctalia"]
+            post_deploy = [{ cmd = "reload", environments = ["caelestia", "noctalia"] }]
+            "#,
+        )
+        .unwrap();
+
+        let component = &manifest.components[0];
+        assert!(component.applies_to_environment(Some("caelestia")));
+        assert!(component.applies_to_environment(Some("noctalia")));
+        assert!(!component.applies_to_environment(Some("kde")));
+        assert!(component.post_deploy[0].applies_to_environment(Some("noctalia")));
+    }
+
+    #[test]
+    fn legacy_single_environment_is_still_accepted() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+            [[components]]
+            name = "legacy-component"
+            environment = "caelestia"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.components[0].environments, ["caelestia"]);
     }
 
     #[test]

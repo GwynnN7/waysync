@@ -495,9 +495,10 @@ fn category_components_loop(
             };
 
             let env_tag = comp
-                .environment
-                .as_ref()
-                .map(|e| format!(" {}", style(format!("[{}]", e)).magenta()))
+                .environment_label()
+                .map(|environments| {
+                    format!(" {}", style(format!("[{}]", environments)).magenta())
+                })
                 .unwrap_or_default();
 
             let meta = style(format!(
@@ -708,9 +709,8 @@ fn status_lines(manifest: &Manifest, state: &State) -> Vec<String> {
                 .unwrap_or(0);
 
             let env_tag = comp
-                .environment
-                .as_ref()
-                .map(|e| format!(" [{}]", e))
+                .environment_label()
+                .map(|environments| format!(" [{}]", environments))
                 .unwrap_or_default();
 
             if enabled && deployed_count > 0 {

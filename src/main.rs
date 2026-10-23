@@ -494,18 +494,47 @@ fn selection_requires_sudo(
         .any(|component| component_requires_sudo(component, active_env))
 }
 
-fn enabled_environment_components_require_sudo(
+fn deactivated_environment_components_require_sudo(
     manifest: &Manifest,
     state: &State,
-    environment: &str,
+    old_environment: &str,
+    new_environment: Option<&str>,
 ) -> bool {
     manifest
-        .components_only_for_environment(environment)
+        .components_only_for_environment(old_environment)
         .into_iter()
         .filter(|component| {
-            state.is_enabled(&component.name) || state.deployed.contains_key(&component.name)
+            !component.applies_to_environment(new_environment)
+                && (state.is_enabled(&component.name) || state.deployed.contains_key(&component.name))
         })
-        .any(|component| component_requires_sudo(component, Some(environment)))
+        .any(|component| component_requires_sudo(component, Some(old_environment)))
+}
+
+/// Components that first become active in `new_environment`.
+/// Components shared by both environments remain active without reconfiguration.
+fn components_becoming_active<'a>(
+    manifest: &'a Manifest,
+    old_environment: Option<&str>,
+    new_environment: &str,
+) -> Vec<&'a manifest::Component> {
+    manifest
+        .components_only_for_environment(new_environment)
+        .into_iter()
+        .filter(|component| !component.applies_to_environment(old_environment))
+        .collect()
+}
+
+/// Components that no longer apply after the environment switch.
+fn components_becoming_inactive<'a>(
+    manifest: &'a Manifest,
+    old_environment: &str,
+    new_environment: Option<&str>,
+) -> Vec<&'a manifest::Component> {
+    manifest
+        .components_only_for_environment(old_environment)
+        .into_iter()
+        .filter(|component| !component.applies_to_environment(new_environment))
+        .collect()
 }
 
 /// Whether switching environments changes a global component's effective deployment.
@@ -539,7 +568,7 @@ fn global_component_is_affected_by_environment_change(
         .post_install
         .iter()
         .chain(component.post_deploy.iter())
-        .any(|hook| hook.environment().is_some() && hook.applies_to_environment(new_env));
+        .any(|hook| hook.is_environment_scoped() && hook.applies_to_environment(new_env));
 
     files_are_affected || activates_environment_hook
 }
@@ -750,7 +779,7 @@ fn change_environment(
     let old_env = state.active_environment.clone();
 
     let env_selection = if let Some(env_name) = new_env {
-        let new_env_components = manifest.components_only_for_environment(env_name);
+        let new_env_components = components_becoming_active(manifest, old_env.as_deref(), env_name);
         if !new_env_components.is_empty() {
             println!(
                 "\nConfigure components for environment {}:",
@@ -786,8 +815,13 @@ fn change_environment(
 
     let old_environment_requires_sudo = old_env
         .as_deref()
-        .map(|environment| {
-            enabled_environment_components_require_sudo(manifest, state, environment)
+        .map(|old_environment| {
+            deactivated_environment_components_require_sudo(
+                manifest,
+                state,
+                old_environment,
+                new_env,
+            )
         })
         .unwrap_or(false);
     let new_selection_requires_sudo = env_selection
@@ -798,7 +832,7 @@ fn change_environment(
         .components
         .iter()
         .filter(|component| {
-            component.environment.is_none()
+            component.is_global()
                 && state.is_enabled(&component.name)
                 && global_component_is_affected_by_environment_change(
                     component,
@@ -825,13 +859,16 @@ fn change_environment(
     );
 
     let mut new_active_names: HashSet<&str> = manifest
-        .components
-        .iter()
-        .filter(|c| c.environment.is_none() && state.is_enabled(&c.name))
+        .components_for_environment(new_env)
+        .into_iter()
+        .filter(|component| state.is_enabled(&component.name))
         .map(|c| c.name.as_str())
         .collect();
 
     if let Some(ref sel) = env_selection {
+        for name in &sel.disabled {
+            new_active_names.remove(name.as_str());
+        }
         for name in &sel.enabled {
             new_active_names.insert(name.as_str());
         }
@@ -844,18 +881,17 @@ fn change_environment(
     );
 
     if let Some(ref old) = old_env {
-        let old_components: Vec<_> = manifest
-            .components_only_for_environment(old)
+        let old_components: Vec<_> = components_becoming_inactive(manifest, old, new_env)
             .into_iter()
             .filter(|c| state.is_enabled(&c.name) || state.deployed.contains_key(&c.name))
             .collect();
 
         for comp in old_components {
             println!(
-                "  {} {} (environment: {})",
+                "  {} {} (environments: {})",
                 style("[-]").red(),
                 comp.name,
-                old
+                comp.environment_label().unwrap_or_default()
             );
             let pkgs_to_remove =
                 component_packages_not_retained(comp, &config.repo_dir, &retained_pkgs);
@@ -883,22 +919,22 @@ fn change_environment(
             if !comp.files.is_empty() {
                 deploy::redeploy_component_files(comp, config, state, new_env)?;
             }
-            // Run any post_install hooks specifically scoped to the newly activated environment
-            if new_env.is_some() {
-                let env_specific_install: Vec<_> = comp
-                    .post_install
-                    .iter()
-                    .filter(|h| h.environment() == new_env)
-                    .cloned()
-                    .collect();
-                if !env_specific_install.is_empty() {
-                    hooks::run_hooks(
-                        &env_specific_install,
-                        "post_install",
-                        new_env,
-                        &config.repo_dir,
-                    )?;
-                }
+            // Run post-install hooks scoped to the newly activated environment.
+            let env_specific_install: Vec<_> = comp
+                .post_install
+                .iter()
+                .filter(|hook| {
+                    hook.is_environment_scoped() && hook.applies_to_environment(new_env)
+                })
+                .cloned()
+                .collect();
+            if !env_specific_install.is_empty() {
+                hooks::run_hooks(
+                    &env_specific_install,
+                    "post_install",
+                    new_env,
+                    &config.repo_dir,
+                )?;
             }
             if !comp.post_deploy.is_empty() {
                 hooks::run_hooks(&comp.post_deploy, "post_deploy", new_env, &config.repo_dir)?;
@@ -976,15 +1012,15 @@ mod tests {
             [[components.files]]
             src = "shell.conf"
             dest = "~/.config/shell.conf"
-            environment = "caelestia"
+            environments = ["caelestia"]
 
             [[components]]
             name = "new-environment-hook"
-            post_deploy = [{ cmd = "reload", environment = "noctalia" }]
+            post_deploy = [{ cmd = "reload", environments = ["noctalia"] }]
 
             [[components]]
             name = "old-environment-hook"
-            post_deploy = [{ cmd = "reload", environment = "caelestia" }]
+            post_deploy = [{ cmd = "reload", environments = ["caelestia"] }]
 
             [[components]]
             name = "external-repo"
@@ -1027,7 +1063,7 @@ mod tests {
 
             [[components]]
             name = "old-environment"
-            environment = "caelestia"
+            environments = ["caelestia"]
             packages = ["shared-package", "old-only-package"]
             "#,
         )
@@ -1046,5 +1082,39 @@ mod tests {
             component_packages_not_retained(old_component, &config.repo_dir, &retained),
             vec!["old-only-package"]
         );
+    }
+
+    #[test]
+    fn components_shared_by_both_environments_stay_active_during_a_switch() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+            [[components]]
+            name = "old-only"
+            environments = ["caelestia"]
+
+            [[components]]
+            name = "shared"
+            environments = ["caelestia", "noctalia"]
+
+            [[components]]
+            name = "new-only"
+            environments = ["noctalia"]
+            "#,
+        )
+        .unwrap();
+
+        let becoming_active: Vec<_> =
+            components_becoming_active(&manifest, Some("caelestia"), "noctalia")
+                .into_iter()
+                .map(|component| component.name.as_str())
+                .collect();
+        let becoming_inactive: Vec<_> =
+            components_becoming_inactive(&manifest, "caelestia", Some("noctalia"))
+                .into_iter()
+                .map(|component| component.name.as_str())
+                .collect();
+
+        assert_eq!(becoming_active, vec!["new-only"]);
+        assert_eq!(becoming_inactive, vec!["old-only"]);
     }
 }

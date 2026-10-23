@@ -69,7 +69,7 @@ When an environment (e.g., `caelestia` or `noctalia`) is active, waysync resolve
 
 ### Per-file Environment Scope
 
-Use `environment` on an individual `[[components.files]]` entry when a component has both shared files and files that should exist only in one environment. Entries without it deploy in every environment; a tagged entry deploys only while its named environment is active. On an environment change, Waysync updates affected enabled global components and removes files that no longer apply.
+Use `environments` on a component, `[[components.files]]` entry, or scoped hook when it should apply to one or more environments. For example, `environments = ["caelestia", "noctalia"]` makes the entry active in either environment. Omit it for a global entry. On an environment change, Waysync keeps components that apply to both environments in place, updates affected enabled global components, and removes files that no longer apply. Existing `environment = "name"` entries remain accepted for compatibility.
 
 This scope applies only to a file entry. Packages and hooks remain component-level; keep those in an environment-specific component when they must not run or install globally.
 
@@ -88,7 +88,7 @@ name = "hypr"                          # Unique component identifier
 category = "wm"                        # Menu category (defaults to "general")
 default = true                         # Checked by default on first run (default: false)
 ask = true                             # Ask before updating an installed component (default: false)
-environment = "caelestia"              # Optional: bind component to a specific environment
+environments = ["caelestia", "noctalia"] # Optional: bind component to one or more environments
 packages = [
     "hyprland",                        # Native Arch or AUR package (installed via paru)
     "local:my-custom-pkg",             # Local PKGBUILD in packages/my-custom-pkg/PKGBUILD
@@ -105,7 +105,7 @@ src = "hypr"                           # Path in dotfiles/ (or overrides/<env>/)
 dest = "$XDG_CONFIG_HOME/hypr"         # Destination path (supports env vars)
 sudo = false                           # Copy/remove using sudo (default: false)
 check = true                           # Prompt with diff if modified locally (default: true)
-environment = "caelestia"              # Optional: deploy this file only in this environment
+environments = ["caelestia", "noctalia"] # Optional: deploy this file only in these environments
 ```
 
 ### Supported Environment Variables in `dest`
