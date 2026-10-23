@@ -99,7 +99,7 @@ fn cmd_init(config: &AppConfig, url: &str) -> Result<()> {
 
 fn cmd_update(config: &AppConfig) -> Result<()> {
     ensure_initialized(config)?;
-    repo::pull_repo(&config.repo_dir)?;
+    repo::pull_managed_repo(&config.repo_dir)?;
     println!("{}", style("Repository updated.").green());
 
     let mut state = State::load(&config.state_file)?;
@@ -133,7 +133,7 @@ fn cmd_env(config: &AppConfig) -> Result<()> {
 
 fn cmd_interactive(config: &AppConfig) -> Result<()> {
     ensure_initialized(config)?;
-    if let Err(error) = repo::pull_repo(&config.repo_dir) {
+    if let Err(error) = repo::pull_managed_repo(&config.repo_dir) {
         eprintln!(
             "Warning: could not refresh the dotfiles repository; using the local copy: {}",
             error
@@ -234,7 +234,7 @@ fn cmd_interactive(config: &AppConfig) -> Result<()> {
                 }
                 MainMenuAction::UpdateRepo => {
                     run_with_visible_output(&term, "Update Repository", || {
-                        repo::pull_repo(&config.repo_dir)?;
+                        repo::pull_managed_repo(&config.repo_dir)?;
                         println!("{}", style("Repository updated.").green());
                         let updated_manifest = Manifest::load(&config.manifest_path())?;
                         sync_enabled_components(config, &updated_manifest, &mut state)?;

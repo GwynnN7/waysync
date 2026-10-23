@@ -59,6 +59,13 @@ my-dotfiles-repo/
         └── PKGBUILD
 ```
 
+Waysync builds local PKGBUILDs in a disposable temporary directory, so source
+checkouts, `.SRCINFO`, and package archives never dirty the managed dotfiles
+repository. On the next repository refresh, it also removes leftovers created
+by older versions. A PKGBUILD whose only local difference is its `pkgver=` line
+is treated as generated and restored before pulling; any other local PKGBUILD
+edit is left intact and Git will still ask you to resolve it.
+
 ### How Overrides Work (`dotfiles/` vs `overrides/<env>/`)
 
 When an environment (e.g., `caelestia` or `noctalia`) is active, waysync resolves every `[[components.files]]` entry as follows:
