@@ -2,15 +2,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::config::AppConfig;
-
-static COPY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+use crate::profile::Profile;
 
 /// Resolved source for a file entry.
 pub enum FileSource {
@@ -25,17 +23,20 @@ pub enum FileSource {
 pub fn expand_env(s: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let get_var = |name: &str| -> String {
-            std::env::var(name).unwrap_or_else(|_| match name {
-                "XDG_CONFIG_HOME" => format!("{}/.config", home),
-                "XDG_DATA_HOME" => format!("{}/.local/share", home),
-                "XDG_STATE_HOME" => format!("{}/.local/state", home),
-                "XDG_CACHE_HOME" => format!("{}/.cache", home),
-                "XDG_BIN_HOME" => format!("{}/.local/bin", home),
-                "XDG_CONFIG_SERVICE" => format!("{}/.config/systemd/user", home),
-                "HOME" => home.clone(),
-                _ => String::new(),
-            })
-        };
+        std::env::var(name).unwrap_or_else(|_| match name {
+            "XDG_CONFIG_HOME" => format!("{}/.config", home),
+            "XDG_DATA_HOME" => format!("{}/.local/share", home),
+            "XDG_STATE_HOME" => format!("{}/.local/state", home),
+            "XDG_CACHE_HOME" => format!("{}/.cache", home),
+            "XDG_BIN_HOME" => format!("{}/.local/bin", home),
+            "XDG_CONFIG_SERVICE" => format!(
+                "{}/systemd/user",
+                std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{}/.config", home))
+            ),
+            "HOME" => home.clone(),
+            _ => String::new(),
+        })
+    };
 
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -55,7 +56,9 @@ pub fn expand_env(s: &str) -> String {
                     let var_name = &var_expr[..idx];
                     let default = &var_expr[idx + 2..];
                     let val = std::env::var(var_name)
-                        .unwrap_or_else(|_| expand_env(default));
+                        .ok()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| expand_env(default));
                     result.push_str(&val);
                 } else {
                     result.push_str(&get_var(&var_expr));
@@ -82,7 +85,89 @@ pub fn expand_env(s: &str) -> String {
         }
     }
 
-    result
+    if result == "~" {
+        home
+    } else if let Some(rest) = result.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        result
+    }
+}
+
+/// Reject unresolved variables and broad destinations before copying or removing.
+pub fn destination_path(value: &str) -> Result<PathBuf> {
+    // Unknown variables must not silently collapse to a different absolute path.
+    let expanded = expand_env(value);
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            continue;
+        }
+        let expression = if chars.peek() == Some(&'{') {
+            chars.next();
+            let mut expression = String::new();
+            let mut closed = false;
+            for c in chars.by_ref() {
+                if c == '}' {
+                    closed = true;
+                    break;
+                }
+                expression.push(c);
+            }
+            if !closed {
+                bail!("Unclosed variable in destination: {value}");
+            }
+            expression
+        } else {
+            let mut name = String::new();
+            while chars
+                .peek()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+            {
+                name.push(chars.next().unwrap());
+            }
+            name
+        };
+        if !expression.contains(":-")
+            && (expression.is_empty() || expand_env(&format!("${{{expression}}}")).is_empty())
+        {
+            bail!("Unset or empty variable '{expression}' in destination: {value}");
+        }
+    }
+    let path = PathBuf::from(&expanded);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("Destination must expand to an absolute path without '..': {value}");
+    }
+    let protected = [
+        "/",
+        "/etc",
+        "/usr",
+        "/usr/bin",
+        "/usr/local",
+        "/usr/local/bin",
+        "/usr/lib",
+        "/usr/share",
+        "/var",
+        "/tmp",
+        "$HOME",
+        "$XDG_CONFIG_HOME",
+        "$XDG_DATA_HOME",
+        "$XDG_STATE_HOME",
+        "$XDG_CACHE_HOME",
+        "$XDG_BIN_HOME",
+        "$XDG_CONFIG_SERVICE",
+    ];
+    if protected
+        .iter()
+        .any(|root| path == Path::new(&expand_env(root)))
+    {
+        bail!("Destination is a protected root: {}", path.display());
+    }
+    Ok(path)
 }
 
 /// Compute SHA256 hash of a byte slice.
@@ -94,145 +179,119 @@ pub fn hash_contents(contents: &[u8]) -> String {
 
 /// Resolve a file source string to a FileSource.
 /// Handles "repo:user/repo" -> Repo, otherwise Local with override resolution.
-pub fn resolve_file_source(
-    src: &str,
-    config: &AppConfig,
-    active_shell: Option<&str>,
-) -> FileSource {
+pub fn resolve_file_source(src: &str, config: &AppConfig, profile: Profile<'_>) -> FileSource {
     if let Some(repo) = src.strip_prefix("repo:") {
         FileSource::Repo(format!("https://github.com/{}", repo))
     } else {
-        FileSource::Local(resolve_local_path(src, config, active_shell))
+        FileSource::Local(resolve_local_path(src, config, profile))
     }
 }
 
 /// Resolve a local dotfile path with environment override priority.
 /// Checks overrides/{environment}/{src} first, then dotfiles/{src}.
-fn resolve_local_path(src: &str, config: &AppConfig, active_shell: Option<&str>) -> PathBuf {
-    if let Some(environment) = active_shell {
-        let override_path = config.override_dir(environment).join(src);
-        if override_path.exists() {
-            return override_path;
-        }
-    }
-    config.dotfiles_dir().join(src)
+fn resolve_local_path(src: &str, config: &AppConfig, profile: Profile<'_>) -> PathBuf {
+    profile
+        .source_roots(config)
+        .into_iter()
+        .rev()
+        .map(|root| root.join(src))
+        .find(|path| path.exists())
+        .unwrap_or_else(|| config.dotfiles_dir().join(src))
 }
 
-/// For directory sources, collect all files with environment override merging.
-/// Returns (absolute_source_path, relative_path_within_src) pairs.
+/// Merge each source layer by relative path; propagate traversal errors.
 pub fn collect_directory_files(
     src: &str,
     config: &AppConfig,
-    active_shell: Option<&str>,
+    profile: Profile<'_>,
 ) -> Result<Vec<(PathBuf, PathBuf)>> {
-    let base_dir = config.dotfiles_dir().join(src);
-    let override_dir =
-        active_shell.map(|environment| config.override_dir(environment).join(src));
-
-    // Use HashMap to merge: override files replace base files by relative path.
     let mut files: HashMap<PathBuf, PathBuf> = HashMap::new();
-
-    // Collect base files
-    if base_dir.exists() && base_dir.is_dir() {
-        for entry in WalkDir::new(&base_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+    for root in profile.source_roots(config) {
+        let directory = root.join(src);
+        if !directory.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(&directory) {
+            let entry = entry.with_context(|| format!("Cannot read {}", directory.display()))?;
+            if entry.file_type().is_symlink() {
+                bail!(
+                    "Symlink sources are unsupported; use a regular file: {}",
+                    entry.path().display()
+                );
+            }
             if entry.file_type().is_file() {
-                if let Ok(relative) = entry.path().strip_prefix(&base_dir) {
-                    files.insert(relative.to_path_buf(), entry.path().to_path_buf());
-                }
+                let relative = entry.path().strip_prefix(&directory)?;
+                files.insert(relative.to_path_buf(), entry.path().to_path_buf());
             }
         }
     }
-
-    // Replace base files with environment override files.
-    if let Some(ref override_path) = override_dir {
-        if override_path.exists() && override_path.is_dir() {
-            for entry in WalkDir::new(override_path)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                if entry.file_type().is_file() {
-                    if let Ok(relative) = entry.path().strip_prefix(override_path) {
-                        files.insert(relative.to_path_buf(), entry.path().to_path_buf());
-                    }
-                }
-            }
-        }
-    }
-
     let mut result: Vec<_> = files.into_iter().map(|(rel, src)| (src, rel)).collect();
     result.sort_by(|a, b| a.1.cmp(&b.1));
     Ok(result)
 }
 
-/// Build a same-directory temporary path so replacement can use an atomic rename.
-fn temporary_copy_path(dest: &Path) -> PathBuf {
-    let name = dest
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("waysync-file");
-    let sequence = COPY_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    dest.with_file_name(format!(
-        ".{}.waysync-{}-{}.tmp",
-        name,
-        std::process::id(),
-        sequence
-    ))
-}
-
-/// Copy a file atomically, optionally with sudo.
+/// Copy beside the destination and atomically replace it, preserving executable bits.
 pub fn copy_file(src: &Path, dest: &Path, sudo: bool) -> Result<()> {
-    let temp = temporary_copy_path(dest);
-
+    let parent = dest.parent().context("Destination has no parent")?;
     if sudo {
-        if let Some(parent) = dest.parent() {
-            run_cmd("sudo", &["mkdir", "-p", &parent.to_string_lossy()])?;
+        run_cmd("sudo", &["mkdir", "-p", "--", &parent.to_string_lossy()])?;
+        // Allocate securely rather than using a predictable PID-based filename.
+        let output = Command::new("sudo")
+            .args(["mktemp", "--tmpdir"])
+            .arg(parent)
+            .arg(".waysync-XXXXXXXXXX")
+            .output()
+            .context("Failed to allocate privileged temporary file")?;
+        if !output.status.success() {
+            bail!("sudo mktemp failed in {}", parent.display());
         }
-        // Copy beside the destination, then rename it into place. Renaming replaces
-        // an executable even while its previous inode is still running.
-        let copy_result = (|| -> Result<()> {
+        let temp = PathBuf::from(String::from_utf8(output.stdout)?.trim());
+        let result = (|| -> Result<()> {
             run_cmd(
                 "sudo",
                 &[
                     "cp",
                     "--preserve=mode",
+                    "--",
                     &src.to_string_lossy(),
                     &temp.to_string_lossy(),
                 ],
             )?;
+            if dest.starts_with("/etc/sudoers.d") {
+                run_cmd("sudo", &["chmod", "0440", "--", &temp.to_string_lossy()])?;
+                run_cmd("sudo", &["visudo", "-cf", &temp.to_string_lossy()])?;
+            }
             run_cmd(
                 "sudo",
-                &["mv", "-f", &temp.to_string_lossy(), &dest.to_string_lossy()],
+                &[
+                    "mv",
+                    "-fT",
+                    "--",
+                    &temp.to_string_lossy(),
+                    &dest.to_string_lossy(),
+                ],
             )
         })();
-        if let Err(error) = copy_result {
-            let _ = Command::new("sudo").args(["rm", "-f"]).arg(&temp).status();
-            return Err(error);
+        if result.is_err() {
+            let _ = Command::new("sudo")
+                .args(["rm", "-f", "--"])
+                .arg(&temp)
+                .status();
         }
-        // sudoers drop-in files must be 0440 and owned by root:root
-        if dest.starts_with("/etc/sudoers.d") {
-            run_cmd("sudo", &["chmod", "0440", &dest.to_string_lossy()])?;
-        }
+        result
     } else {
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
-        }
-        let copy_result = (|| -> Result<()> {
-            fs::copy(src, &temp)
-                .with_context(|| format!("Failed to copy {} -> {}", src.display(), temp.display()))?;
-            fs::rename(&temp, dest).with_context(|| {
-                format!("Failed to replace {} with {}", dest.display(), temp.display())
-            })
-        })();
-        if let Err(error) = copy_result {
-            let _ = fs::remove_file(&temp);
-            return Err(error);
-        }
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+        let temp = tempfile::Builder::new()
+            .prefix(".waysync-")
+            .tempfile_in(parent)?;
+        fs::copy(src, temp.path())
+            .with_context(|| format!("Failed to copy {} -> {}", src.display(), dest.display()))?;
+        temp.as_file().sync_all()?;
+        temp.persist(dest)
+            .with_context(|| format!("Failed to replace {}", dest.display()))?;
+        Ok(())
     }
-    Ok(())
 }
 
 /// Remove a file or directory, optionally with sudo.
@@ -241,7 +300,7 @@ pub fn remove_path(path: &Path, sudo: bool) -> Result<()> {
         return Ok(());
     }
     if sudo {
-        run_cmd("sudo", &["rm", "-rf", &path.to_string_lossy()])?;
+        run_cmd("sudo", &["rm", "-f", "--", &path.to_string_lossy()])?;
     } else if path.is_dir() {
         fs::remove_dir_all(path)
             .with_context(|| format!("Failed to remove directory: {}", path.display()))?;
@@ -265,8 +324,7 @@ pub fn read_file_contents(path: &Path, sudo: bool) -> Result<Vec<u8>> {
         }
         Ok(output.stdout)
     } else {
-        Ok(fs::read(path)
-            .with_context(|| format!("Failed to read: {}", path.display()))?)
+        Ok(fs::read(path).with_context(|| format!("Failed to read: {}", path.display()))?)
     }
 }
 
@@ -277,7 +335,12 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
         .status()
         .with_context(|| format!("Failed to run: {} {}", program, args.join(" ")))?;
     if !status.success() {
-        bail!("{} {} failed with exit code {:?}", program, args.join(" "), status.code());
+        bail!(
+            "{} {} failed with exit code {:?}",
+            program,
+            args.join(" "),
+            status.code()
+        );
     }
     Ok(())
 }
@@ -328,15 +391,33 @@ mod tests {
         std::fs::write(&environment_override, "caelestia").unwrap();
 
         assert_eq!(
-            local_path(resolve_file_source("theme.toml", &config, None)),
+            local_path(resolve_file_source(
+                "theme.toml",
+                &config,
+                Profile::default()
+            )),
             base
         );
         assert_eq!(
-            local_path(resolve_file_source("theme.toml", &config, Some("caelestia"))),
+            local_path(resolve_file_source(
+                "theme.toml",
+                &config,
+                Profile {
+                    environment: Some("caelestia"),
+                    device: None
+                }
+            )),
             environment_override
         );
         assert_eq!(
-            local_path(resolve_file_source("theme.toml", &config, Some("noctalia"))),
+            local_path(resolve_file_source(
+                "theme.toml",
+                &config,
+                Profile {
+                    environment: Some("noctalia"),
+                    device: None
+                }
+            )),
             config.dotfiles_dir().join("theme.toml")
         );
 
@@ -360,11 +441,18 @@ mod tests {
         )
         .unwrap();
 
-        let files: BTreeMap<_, _> = collect_directory_files("hypr", &config, Some("caelestia"))
-            .unwrap()
-            .into_iter()
-            .map(|(source, relative)| (relative, std::fs::read_to_string(source).unwrap()))
-            .collect();
+        let files: BTreeMap<_, _> = collect_directory_files(
+            "hypr",
+            &config,
+            Profile {
+                environment: Some("caelestia"),
+                device: None,
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(source, relative)| (relative, std::fs::read_to_string(source).unwrap()))
+        .collect();
 
         assert_eq!(
             files,
@@ -403,12 +491,48 @@ mod tests {
 
         copy_file(&source, &destination, false).unwrap();
 
-        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "new content");
-        assert!(
-            std::fs::read_dir(&root)
-                .unwrap()
-                .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".waysync-"))
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "new content"
         );
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".waysync-")));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn destination_expansion_supports_tilde_xdg_and_shell_fallbacks() {
+        assert_eq!(
+            destination_path("~/.config/waysync-test").unwrap(),
+            dirs::home_dir().unwrap().join(".config/waysync-test")
+        );
+        assert_eq!(
+            expand_env("${WAYSYNC_TEST_UNSET_99:-/tmp/default}"),
+            "/tmp/default"
+        );
+        assert!(destination_path("$XDG_CONFIG_HOME/waysync-test")
+            .unwrap()
+            .is_absolute());
+        for value in [
+            "$HOME",
+            "/etc/",
+            "/",
+            "/tmp",
+            "relative/file",
+            "/tmp/../etc/file",
+            "$WAYSYNC_TEST_UNSET_99/file",
+            "$HOME$WAYSYNC_TEST_UNSET_99/file",
+            "${HOME/file",
+        ] {
+            assert!(destination_path(value).is_err(), "Should reject {value}");
+        }
     }
 }

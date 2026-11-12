@@ -10,7 +10,7 @@ pub fn clone_repo(url: &str, path: &Path) -> Result<()> {
         bail!("Repository already exists at {}", path.display());
     }
     let status = Command::new("git")
-        .args(["clone", url])
+        .args(["clone", "--", url])
         .arg(path)
         .status()
         .context("Failed to run git clone")?;
@@ -24,37 +24,29 @@ pub fn clone_repo(url: &str, path: &Path) -> Result<()> {
 pub fn pull_repo(path: &Path) -> Result<()> {
     println!("Updating repository at {} ...", path.display());
 
-    pull_repo_after_preparation(path)
+    pull_fast_forward(path)
 }
 
-/// Pull the managed Waysync repository after removing generated local package
-/// build output. This intentionally does not affect repositories deployed as
-/// ordinary file sources.
-pub fn pull_managed_repo(path: &Path) -> Result<()> {
-    println!("Updating repository at {} ...", path.display());
-
-    let removed_artifacts = crate::packages::clean_local_package_build_artifacts(path)?;
-    if removed_artifacts > 0 {
-        println!(
-            "Removed {} generated local package build artifact{}.",
-            removed_artifacts,
-            if removed_artifacts == 1 { "" } else { "s" }
+pub fn ensure_repo_root(path: &Path) -> Result<()> {
+    // Git otherwise walks upward and can accidentally pull an enclosing checkout.
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()?;
+    if !output.status.success()
+        || Path::new(String::from_utf8_lossy(&output.stdout).trim()).canonicalize()?
+            != path.canonicalize()?
+    {
+        bail!(
+            "Destination is not a Git repository root: {}",
+            path.display()
         );
     }
-
-    let restored_pkgvers = crate::packages::restore_generated_pkgver_updates(path)?;
-    if restored_pkgvers > 0 {
-        println!(
-            "Restored {} generated PKGBUILD version update{}.",
-            restored_pkgvers,
-            if restored_pkgvers == 1 { "" } else { "s" }
-        );
-    }
-
-    pull_repo_after_preparation(path)
+    Ok(())
 }
 
-fn pull_repo_after_preparation(path: &Path) -> Result<()> {
+fn pull_fast_forward(path: &Path) -> Result<()> {
+    ensure_repo_root(path)?;
     let status = Command::new("git")
         .args(["pull", "--ff-only"])
         .current_dir(path)

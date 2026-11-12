@@ -2,6 +2,7 @@
 name = "waysync"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 description = "Declarative dotfile & package manager for Arch-based systems"
 
 [dependencies]
@@ -15,4 +16,5 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 similar = "2"
 toml = "0.8"
+tempfile = "3"
 walkdir = "2"

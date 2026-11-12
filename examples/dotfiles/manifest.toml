@@ -1,0 +1,20 @@
+# A small, runnable repository layout. No packages or hooks run in this example.
+[environments]
+available = ["dark", "light"]
+
+[[components]]
+name = "editor"
+category = "applications"
+default = true
+[[components.files]]
+src = "editor"
+dest = "$XDG_CONFIG_HOME/waysync-example/editor"
+
+[[components]]
+name = "laptop-shortcuts"
+category = "hardware"
+devices = ["laptop"]
+default = false
+[[components.files]]
+src = "shortcuts.conf"
+dest = "$XDG_CONFIG_HOME/waysync-example/shortcuts.conf"

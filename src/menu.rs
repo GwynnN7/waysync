@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 
+use crate::profile::{Device, Profile};
 use anyhow::Result;
 use console::{style, Key, Term};
-use dialoguer::Confirm;
+use dialoguer::{Confirm, Input};
 
 use crate::manifest::{Component, Manifest};
 use crate::state::State;
@@ -10,9 +12,14 @@ use crate::state::State;
 #[derive(Clone, Copy)]
 pub enum MainMenuAction {
     ManageComponents,
-    SyncSpecific,
+    InstallSpecific,
+    DeployDotfiles,
+    CaptureChanges,
+    ReinstallPackages,
     UninstallSpecific,
     ChangeEnvironment,
+    ChangeDevice,
+    Check,
     UpdateRepo,
     Status,
     Exit,
@@ -21,7 +28,6 @@ pub enum MainMenuAction {
 pub struct ComponentSelection {
     pub enabled: Vec<String>,
     pub disabled: Vec<String>,
-    pub reinstall: bool,
     pub skip_ask: bool,
 }
 
@@ -30,14 +36,15 @@ enum SelectionMode {
     /// Full declarative state: pre-selects enabled/default; unchecked items are uninstalled.
     Declarative,
     /// Targeted sync/install: starts empty; only selected items are synced, nothing is uninstalled.
-    SyncSpecific,
+    InstallSpecific,
     /// Targeted uninstall: starts empty; only selected items are uninstalled, nothing is synced.
     UninstallSpecific,
+    ReinstallPackages,
 }
 
-/// Clear visible screen, scrollback buffer, and print a clean TUI header.
+/// Clear the visible screen and print a header without erasing scrollback.
 pub fn render_header(term: &Term, subtitle: &str) -> Result<()> {
-    print!("\x1b[2J\x1b[3J\x1b[H");
+    print!("\x1b[2J\x1b[H");
     term.flush()?;
     println!(
         "  {} {}",
@@ -67,15 +74,12 @@ pub fn wait_for_enter() -> Result<()> {
     Ok(())
 }
 
-/// Render a short result screen before returning to the main menu.
-pub fn show_completion(term: &Term, title: &str, message: &str) -> Result<()> {
-    render_header(term, title)?;
-    println!("  {} {}", style("✓").green().bold(), style(message).green().bold());
-    Ok(())
-}
-
 /// Ask whether an already installed optional component should be updated now.
 pub fn confirm_component_update(component: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        println!("  Skipping optional file update for '{component}' (no interactive terminal).");
+        return Ok(false);
+    }
     Confirm::new()
         .with_prompt(format!("Update optional component '{}' now?", component))
         .default(false)
@@ -84,10 +88,10 @@ pub fn confirm_component_update(component: &str) -> Result<bool> {
 }
 
 /// Interactive Main Menu.
-pub fn show_main_menu(manifest: &Manifest, active_env: Option<&str>) -> Result<MainMenuAction> {
+pub fn show_main_menu(manifest: &Manifest, profile: Profile<'_>) -> Result<MainMenuAction> {
     let term = Term::stdout();
     let _ = term.hide_cursor();
-    let res = main_menu_loop(&term, manifest, active_env);
+    let res = main_menu_loop(&term, manifest, profile);
     let _ = term.show_cursor();
     res
 }
@@ -95,19 +99,24 @@ pub fn show_main_menu(manifest: &Manifest, active_env: Option<&str>) -> Result<M
 fn main_menu_loop(
     term: &Term,
     manifest: &Manifest,
-    active_env: Option<&str>,
+    profile: Profile<'_>,
 ) -> Result<MainMenuAction> {
-    let has_envs = manifest.environments.is_some();
+    let has_envs = !manifest.available_environments().is_empty();
 
     let mut entries: Vec<(&str, MainMenuAction)> = vec![
         ("📦 Manage Components", MainMenuAction::ManageComponents),
-        ("⚡ Install Components", MainMenuAction::SyncSpecific),
+        ("📄 Deploy Dotfiles", MainMenuAction::DeployDotfiles),
+        ("📥 Capture Local Changes", MainMenuAction::CaptureChanges),
+        ("⚡ Install Components", MainMenuAction::InstallSpecific),
         ("🗑️ Uninstall Components", MainMenuAction::UninstallSpecific),
     ];
+    entries.push(("🔧 Reinstall Packages", MainMenuAction::ReinstallPackages));
     if has_envs {
         entries.push(("🖥️ Change Environment", MainMenuAction::ChangeEnvironment));
     }
+    entries.push(("💻 Change Device", MainMenuAction::ChangeDevice));
     entries.extend_from_slice(&[
+        ("🔎 Check Configuration", MainMenuAction::Check),
         ("🔄 Update Repository", MainMenuAction::UpdateRepo),
         ("📊 Status", MainMenuAction::Status),
         ("🚪 Exit", MainMenuAction::Exit),
@@ -119,11 +128,24 @@ fn main_menu_loop(
         render_header(term, "Main Menu")?;
 
         if has_envs {
-            let env_label = active_env.unwrap_or("none");
+            let env_label = profile.environment.unwrap_or("none");
             println!("  Environment: {}\n", style(env_label).cyan().bold());
         }
 
-        for (i, (label, _)) in entries.iter().enumerate() {
+        println!(
+            "  Device: {}\n",
+            style(
+                profile
+                    .device
+                    .map(|device| device.to_string())
+                    .unwrap_or_else(|| "none".into())
+            )
+            .cyan()
+            .bold()
+        );
+
+        let range = visible_range(entries.len(), cursor, term.size().0, 11);
+        for (i, (label, _)) in entries.iter().enumerate().take(range.end).skip(range.start) {
             let prefix = if i == cursor {
                 style("❯").cyan().bold()
             } else {
@@ -137,14 +159,48 @@ fn main_menu_loop(
             println!("  {} {}", prefix, styled_label);
         }
 
+        let description = match entries[cursor].1 {
+            MainMenuAction::ManageComponents => {
+                "Apply selection: install new, restore missing packages, remove unchecked, deploy files."
+            }
+            MainMenuAction::DeployDotfiles => {
+                "Copy files for installed components; choose whether to run deployment hooks."
+            }
+            MainMenuAction::CaptureChanges => "Review deployed edits from ask=true components and copy them into your Git checkout.",
+            MainMenuAction::InstallSpecific => {
+                "Install packages + files, run setup hooks, and enable selected components."
+            }
+            MainMenuAction::UninstallSpecific => {
+                "Remove unshared packages + managed files and disable selected components."
+            }
+            MainMenuAction::ReinstallPackages => {
+                "Force package reinstall/builds only. No files, hooks, or selection changes."
+            }
+            MainMenuAction::UpdateRepo => "Pull Git changes only. Deploy or apply separately.",
+            MainMenuAction::ChangeEnvironment | MainMenuAction::ChangeDevice => {
+                "Switch one profile axis and apply only affected components."
+            }
+            MainMenuAction::Check => {
+                "Validate local inputs without hooks, package managers, or network access."
+            }
+            MainMenuAction::Status => {
+                "Show Waysync tracking; does not scan external package installations."
+            }
+            MainMenuAction::Exit => "Return to the terminal.",
+        };
+        println!("\n  {}", style(description).dim());
         println!(
-            "\n  {}",
+            "  {}",
             style("↑/↓: Navigate  •  Enter: Select  •  q/Esc: Exit").dim()
         );
 
         match term.read_key()? {
             Key::ArrowUp | Key::Char('k') => {
-                cursor = if cursor == 0 { entries.len() - 1 } else { cursor - 1 };
+                cursor = if cursor == 0 {
+                    entries.len() - 1
+                } else {
+                    cursor - 1
+                };
             }
             Key::ArrowDown | Key::Char('j') => {
                 cursor = (cursor + 1) % entries.len();
@@ -167,11 +223,11 @@ pub fn show_components_menu(
 }
 
 /// Targeted component sync/install menu (starts with nothing selected; does not uninstall unselected).
-pub fn show_sync_specific_menu(
+pub fn show_install_menu(
     components: &[&Component],
     state: &State,
 ) -> Result<Option<ComponentSelection>> {
-    run_components_menu(components, state, SelectionMode::SyncSpecific)
+    run_components_menu(components, state, SelectionMode::InstallSpecific)
 }
 
 /// Targeted component uninstall menu (starts with nothing selected; only uninstalls selected).
@@ -182,12 +238,43 @@ pub fn show_uninstall_menu(
     run_components_menu(components, state, SelectionMode::UninstallSpecific)
 }
 
+pub fn show_reinstall_menu(
+    components: &[&Component],
+    state: &State,
+) -> Result<Option<ComponentSelection>> {
+    run_components_menu(components, state, SelectionMode::ReinstallPackages)
+}
+
+pub fn capture_checkout(current: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    render_header(&Term::stdout(), "Capture Local Changes")?;
+    println!("  Copy deployed edits from ask=true components into your authoring Git checkout.\n  Files are reviewed before copying. Nothing is committed or pushed.\n");
+    let input = Input::<String>::new()
+        .with_prompt("Authoring dotfiles checkout (e.g. ~/Projects/dotfiles)")
+        .with_initial_text(
+            current
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )
+        .interact_text()?;
+    Ok(std::path::PathBuf::from(crate::utils::expand_env(&input)))
+}
+
+pub fn confirm_deploy_hooks() -> Result<bool> {
+    Confirm::new()
+        .with_prompt("Run post_deploy hooks after copying files? (No skips all hooks)")
+        .default(true)
+        .interact()
+        .map_err(Into::into)
+}
+
 fn run_components_menu(
     components: &[&Component],
     state: &State,
     mode: SelectionMode,
 ) -> Result<Option<ComponentSelection>> {
     if components.is_empty() {
+        println!("No components are available for this action.");
+        wait_for_enter()?;
         return Ok(None);
     }
 
@@ -195,7 +282,45 @@ fn run_components_menu(
     let _ = term.hide_cursor();
     let res = components_menu_loop(&term, components, state, mode);
     let _ = term.show_cursor();
-    res
+    let Some(selection) = res? else {
+        return Ok(None);
+    };
+    let removals: Vec<_> = selection
+        .disabled
+        .iter()
+        .filter(|name| state.is_installed(name))
+        .collect();
+    term.clear_screen()?;
+    println!(
+        "  Select {} component(s) for this action; remove {} installed component(s).",
+        selection.enabled.len(),
+        removals.len()
+    );
+    if !removals.is_empty() {
+        println!(
+            "  Remove: {}",
+            removals
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    match mode {
+        SelectionMode::Declarative => println!("  New: install packages/files. Managed: restore missing packages and deploy. Unchecked: uninstall."),
+        SelectionMode::InstallSpecific => println!("  Install packages and files, run install/deploy hooks, and enable tracking."),
+        SelectionMode::UninstallSpecific => println!("  Remove unshared packages and unchanged managed files, then disable tracking."),
+        SelectionMode::ReinstallPackages => println!("  Force package installation/builds only. Files, hooks, and component selection stay unchanged."),
+    }
+    if Confirm::new()
+        .with_prompt("Apply this selection?")
+        .default(removals.is_empty())
+        .interact()?
+    {
+        Ok(Some(selection))
+    } else {
+        Ok(None)
+    }
 }
 
 fn components_menu_loop(
@@ -229,22 +354,37 @@ fn components_menu_loop(
         }
     }
 
-    let show_reinstall = mode != SelectionMode::UninstallSpecific;
-    let mut reinstall = false;
     let mut cursor = 0;
-    let action_rows = if show_reinstall { 2 } else { 1 };
-    let total_rows = category_order.len() + action_rows;
+    let total_rows = category_order.len() + 1;
 
     let header_title = match mode {
         SelectionMode::Declarative => "Manage Components",
-        SelectionMode::SyncSpecific => "Install Components",
+        SelectionMode::InstallSpecific => "Install Components",
         SelectionMode::UninstallSpecific => "Uninstall Components",
+        SelectionMode::ReinstallPackages => "Reinstall Packages Only",
     };
 
     loop {
         render_header(term, header_title)?;
 
-        for (i, cat) in category_order.iter().enumerate() {
+        let range = visible_range(
+            category_order.len(),
+            cursor.min(category_order.len().saturating_sub(1)),
+            term.size().0,
+            12,
+        );
+        println!(
+            "  Categories {}–{} of {}",
+            range.start + 1,
+            range.end,
+            category_order.len()
+        );
+        for (i, cat) in category_order
+            .iter()
+            .enumerate()
+            .take(range.end)
+            .skip(range.start)
+        {
             let comps = &by_category[cat];
             let selected_count = comps
                 .iter()
@@ -293,29 +433,7 @@ fn components_menu_loop(
 
         println!();
 
-        let (reinstall_idx, save_idx) = if show_reinstall {
-            let r_idx = category_order.len();
-            let p_reinstall = if cursor == r_idx {
-                style("❯").cyan().bold()
-            } else {
-                style(" ").dim()
-            };
-            let c_reinstall = if reinstall {
-                style("[✓]").yellow().bold()
-            } else {
-                style("[ ]").dim()
-            };
-            let l_reinstall = if cursor == r_idx {
-                style("Reinstall").yellow().bold()
-            } else {
-                style("Reinstall").yellow()
-            };
-            println!("  {} {} {}", p_reinstall, c_reinstall, l_reinstall);
-            (Some(r_idx), category_order.len() + 1)
-        } else {
-            (None, category_order.len())
-        };
-
+        let save_idx = category_order.len();
         let p_save = if cursor == save_idx {
             style("❯").cyan().bold()
         } else {
@@ -324,16 +442,23 @@ fn components_menu_loop(
         let l_save = match mode {
             SelectionMode::Declarative => {
                 if cursor == save_idx {
-                    style("💾 Save & Apply").green().bold()
+                    style("💾 Apply Selection").green().bold()
                 } else {
-                    style("💾 Save & Apply").green()
+                    style("💾 Apply Selection").green()
                 }
             }
-            SelectionMode::SyncSpecific => {
+            SelectionMode::InstallSpecific => {
                 if cursor == save_idx {
                     style("⚡ Install Selected").green().bold()
                 } else {
                     style("⚡ Install Selected").green()
+                }
+            }
+            SelectionMode::ReinstallPackages => {
+                if cursor == save_idx {
+                    style("🔧 Reinstall Selected Packages").yellow().bold()
+                } else {
+                    style("🔧 Reinstall Selected Packages").yellow()
                 }
             }
             SelectionMode::UninstallSpecific => {
@@ -354,7 +479,11 @@ fn components_menu_loop(
 
         match term.read_key()? {
             Key::ArrowUp | Key::Char('k') => {
-                cursor = if cursor == 0 { total_rows - 1 } else { cursor - 1 };
+                cursor = if cursor == 0 {
+                    total_rows - 1
+                } else {
+                    cursor - 1
+                };
             }
             Key::ArrowDown | Key::Char('j') => {
                 cursor = (cursor + 1) % total_rows;
@@ -373,8 +502,6 @@ fn components_menu_loop(
                             selected_set.insert(comp.name.clone());
                         }
                     }
-                } else if Some(cursor) == reinstall_idx {
-                    reinstall = !reinstall;
                 }
             }
             Key::Enter | Key::ArrowRight | Key::Char('l') => {
@@ -382,8 +509,6 @@ fn components_menu_loop(
                     let cat = &category_order[cursor];
                     let comps = &by_category[cat];
                     category_components_loop(term, cat, comps, state, &mut selected_set, mode)?;
-                } else if Some(cursor) == reinstall_idx {
-                    reinstall = !reinstall;
                 } else if cursor == save_idx {
                     match mode {
                         SelectionMode::Declarative => {
@@ -399,11 +524,10 @@ fn components_menu_loop(
                             return Ok(Some(ComponentSelection {
                                 enabled,
                                 disabled,
-                                reinstall,
                                 skip_ask: false,
                             }));
                         }
-                        SelectionMode::SyncSpecific => {
+                        SelectionMode::InstallSpecific | SelectionMode::ReinstallPackages => {
                             let enabled: Vec<String> = components
                                 .iter()
                                 .filter(|c| selected_set.contains(&c.name))
@@ -415,7 +539,6 @@ fn components_menu_loop(
                             return Ok(Some(ComponentSelection {
                                 enabled,
                                 disabled: Vec::new(),
-                                reinstall,
                                 skip_ask: true,
                             }));
                         }
@@ -431,7 +554,6 @@ fn components_menu_loop(
                             return Ok(Some(ComponentSelection {
                                 enabled: Vec::new(),
                                 disabled,
-                                reinstall: false,
                                 skip_ask: false,
                             }));
                         }
@@ -456,12 +578,30 @@ fn category_components_loop(
     mode: SelectionMode,
 ) -> Result<()> {
     let mut cursor = 0;
-    let total_rows = comps.len();
+    let mut query = String::new();
 
     loop {
+        let visible: Vec<_> = comps
+            .iter()
+            .copied()
+            .filter(|component| {
+                component
+                    .name
+                    .to_lowercase()
+                    .contains(&query.to_lowercase())
+            })
+            .collect();
+        let total_rows = visible.len();
+        cursor = cursor.min(total_rows.saturating_sub(1));
         render_header(term, &format!("Category: {}", category))?;
+        let range = visible_range(total_rows, cursor, term.size().0, 10);
+        println!(
+            "  {} matching components  •  Filter: {}\n",
+            total_rows,
+            if query.is_empty() { "all" } else { &query }
+        );
 
-        for (i, comp) in comps.iter().enumerate() {
+        for (i, comp) in visible.iter().enumerate().take(range.end).skip(range.start) {
             let is_selected = i == cursor;
             let is_checked = selected_set.contains(&comp.name);
 
@@ -496,9 +636,7 @@ fn category_components_loop(
 
             let env_tag = comp
                 .environment_label()
-                .map(|environments| {
-                    format!(" {}", style(format!("[{}]", environments)).magenta())
-                })
+                .map(|environments| format!(" {}", style(format!("[{}]", environments)).magenta()))
                 .unwrap_or_default();
 
             let meta = style(format!(
@@ -508,48 +646,71 @@ fn category_components_loop(
             ))
             .dim();
 
-            let installed_badge = if mode == SelectionMode::SyncSpecific
-                && (state.is_enabled(&comp.name) || state.deployed.contains_key(&comp.name))
-            {
-                format!(" {}", style("[installed]").green().dim())
+            let installed_badge = if state.is_installed(&comp.name) {
+                format!(" {}", style("[managed]").green().dim())
             } else {
                 String::new()
             };
 
+            let device_tag = if comp.devices.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [{}]",
+                    comp.devices
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             println!(
-                "  {} {} {}{}{}{}",
-                pointer, checkbox, name, env_tag, meta, installed_badge
+                "  {} {} {}{}{}{}{}",
+                pointer, checkbox, name, env_tag, device_tag, meta, installed_badge
             );
         }
 
         println!(
             "\n  {}",
-            style("↑/↓: Navigate  •  Space: Toggle  •  a: Toggle All  •  Enter/Esc: Back").dim()
+            style("↑/↓: Navigate  •  Space: Toggle  •  a: Toggle Matches  •  /: Filter  •  Enter/Esc: Back").dim()
         );
 
         match term.read_key()? {
             Key::ArrowUp | Key::Char('k') => {
-                cursor = if cursor == 0 { total_rows - 1 } else { cursor - 1 };
+                cursor = if cursor == 0 {
+                    total_rows.saturating_sub(1)
+                } else {
+                    cursor - 1
+                };
             }
             Key::ArrowDown | Key::Char('j') => {
-                cursor = (cursor + 1) % total_rows;
+                cursor = (cursor + 1) % total_rows.max(1);
             }
-            Key::Char(' ') => {
-                let name = &comps[cursor].name;
+            Key::Char(' ') if total_rows > 0 => {
+                let name = &visible[cursor].name;
                 if selected_set.contains(name) {
                     selected_set.remove(name);
                 } else {
                     selected_set.insert(name.clone());
                 }
             }
+            Key::Char('/') => {
+                let _ = term.show_cursor();
+                query = Input::<String>::new()
+                    .with_prompt("Filter (empty clears)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                let _ = term.hide_cursor();
+                cursor = 0;
+            }
             Key::Char('a') => {
-                let all_selected = comps.iter().all(|c| selected_set.contains(&c.name));
+                let all_selected = visible.iter().all(|c| selected_set.contains(&c.name));
                 if all_selected {
-                    for comp in comps {
+                    for comp in &visible {
                         selected_set.remove(&comp.name);
                     }
                 } else {
-                    for comp in comps {
+                    for comp in &visible {
                         selected_set.insert(comp.name.clone());
                     }
                 }
@@ -577,7 +738,7 @@ pub fn show_environment_menu(
 
     let term = Term::stdout();
     let _ = term.hide_cursor();
-    let res = environment_menu_loop(&term, &envs, current);
+    let res = environment_menu_loop(&term, &envs, current, "Select Environment");
     let _ = term.show_cursor();
     res
 }
@@ -586,6 +747,7 @@ fn environment_menu_loop(
     term: &Term,
     envs: &[&str],
     current: Option<&str>,
+    title: &str,
 ) -> Result<Option<Option<String>>> {
     let mut cursor = match current {
         None => 0,
@@ -599,12 +761,12 @@ fn environment_menu_loop(
     let total_rows = envs.len() + 1;
 
     loop {
-        render_header(term, "Select Environment")?;
+        render_header(term, title)?;
 
         let current_label = current.unwrap_or("none");
         println!("  Current: {}\n", style(current_label).cyan().bold());
 
-        for i in 0..total_rows {
+        for i in visible_range(total_rows, cursor, term.size().0, 9) {
             let is_selected = i == cursor;
             let pointer = if is_selected {
                 style("❯").cyan().bold()
@@ -641,7 +803,11 @@ fn environment_menu_loop(
 
         match term.read_key()? {
             Key::ArrowUp | Key::Char('k') => {
-                cursor = if cursor == 0 { total_rows - 1 } else { cursor - 1 };
+                cursor = if cursor == 0 {
+                    total_rows - 1
+                } else {
+                    cursor - 1
+                };
             }
             Key::ArrowDown | Key::Char('j') => {
                 cursor = (cursor + 1) % total_rows;
@@ -664,17 +830,35 @@ fn status_lines(manifest: &Manifest, state: &State) -> Vec<String> {
     if let Some(ref url) = state.repo_url {
         lines.push(format!("  Repository: {}", style(url).dim()));
     }
-    let env_label = state
-        .active_environment
-        .as_deref()
-        .unwrap_or("none");
+    let env_label = state.active_environment.as_deref().unwrap_or("none");
     lines.push(format!(
         "  Active environment: {}",
         style(env_label).cyan().bold()
     ));
 
-    let active_env = state.active_environment.as_deref();
-    let components = manifest.components_for_environment(active_env);
+    lines.push(format!(
+        "  Device: {}",
+        style(
+            state
+                .active_device
+                .map(|device| device.to_string())
+                .unwrap_or_else(|| "none".into())
+        )
+        .cyan()
+        .bold()
+    ));
+    lines.push(
+        "  Installed status is tracked by Waysync; external packages are not scanned.".into(),
+    );
+    let components = manifest.components_for_profile(state.profile());
+    for component in &manifest.components {
+        if !component.applies_to(state.profile()) && state.is_installed(&component.name) {
+            lines.push(format!(
+                "  ! {}: inactive but still installed; cleanup pending",
+                component.name
+            ));
+        }
+    }
 
     if components.is_empty() {
         lines.push("  No components configured.".to_string());
@@ -697,23 +881,30 @@ fn status_lines(manifest: &Manifest, state: &State) -> Vec<String> {
         lines.push(format!("  {}", style(format!("┌─ {} ─┐", cat)).dim()));
         for comp in &by_category[cat] {
             let enabled = state.is_enabled(&comp.name);
+            let installed = state.is_installed(&comp.name);
             let status_icon = if enabled {
                 style("✓").green().bold()
             } else {
                 style("✗").red()
             };
-            let deployed_count = state
-                .deployed
-                .get(&comp.name)
-                .map(|d| d.len())
-                .unwrap_or(0);
+            let deployed_count = state.deployed.get(&comp.name).map(|d| d.len()).unwrap_or(0);
 
+            if state.pending_install.contains(&comp.name) {
+                lines.push(format!(
+                    "    ! {} (installation hook pending; run sync)",
+                    comp.name
+                ));
+            }
             let env_tag = comp
                 .environment_label()
                 .map(|environments| format!(" [{}]", environments))
                 .unwrap_or_default();
 
-            if enabled && deployed_count > 0 {
+            if !enabled && installed {
+                lines.push(format!("    ! {} (disabled; cleanup pending)", comp.name));
+            } else if enabled && !installed {
+                lines.push(format!("    ! {} (enabled; sync pending)", comp.name));
+            } else if enabled && deployed_count > 0 {
                 lines.push(format!(
                     "    {} {}{} {} files deployed",
                     status_icon,
@@ -785,4 +976,90 @@ pub fn show_status_menu(manifest: &Manifest, state: &State) -> Result<()> {
 
     let _ = term.show_cursor();
     result
+}
+
+/// Keep the current row visible, including on short laptop terminals.
+fn visible_range(
+    total: usize,
+    cursor: usize,
+    rows: u16,
+    reserved: usize,
+) -> std::ops::Range<usize> {
+    let height = usize::from(rows).saturating_sub(reserved).max(1);
+    let start = cursor
+        .saturating_sub(height / 2)
+        .min(total.saturating_sub(height));
+    start..(start + height).min(total)
+}
+
+pub fn show_device_menu(current: Option<Device>) -> Result<Option<Option<Device>>> {
+    let term = Term::stdout();
+    let label = current.map(|device| device.to_string());
+    let _ = term.hide_cursor();
+    let result = environment_menu_loop(
+        &term,
+        &["desktop", "laptop"],
+        label.as_deref(),
+        "Select Device",
+    );
+    let _ = term.show_cursor();
+    Ok(result?.map(|choice| {
+        choice.map(|name| {
+            if name == "desktop" {
+                Device::Desktop
+            } else {
+                Device::Laptop
+            }
+        })
+    }))
+}
+
+pub struct ScreenGuard;
+impl ScreenGuard {
+    pub fn enter(term: &Term) -> Result<Self> {
+        print!("\x1b[?1049h");
+        term.flush()?;
+        Ok(Self)
+    }
+}
+impl Drop for ScreenGuard {
+    fn drop(&mut self) {
+        let term = Term::stdout();
+        let _ = term.show_cursor();
+        print!("\x1b[?1049l");
+        let _ = term.flush();
+    }
+}
+
+/// Preserve command output in scrollback and keep recoverable errors in the app.
+pub fn with_visible_output(term: &Term, operation: impl FnOnce() -> Result<()>) -> Result<()> {
+    print!("\x1b[?1049l");
+    let _ = term.show_cursor();
+    term.flush()?;
+    match operation() {
+        Ok(()) => println!("\n  Finished. Review the output above."),
+        Err(error) => eprintln!("\n  Operation failed: {error:#}\n  Review the diagnostics before retrying this action. Completed work remains applied."),
+    }
+    wait_for_enter()?;
+    print!("\x1b[?1049h");
+    term.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_keeps_cursor_visible_at_both_ends_and_on_short_terminals() {
+        for total in [0, 1, 5, 80] {
+            for rows in [6, 24, 50] {
+                for cursor in 0..total {
+                    let range = visible_range(total, cursor, rows, 10);
+                    assert!(range.contains(&cursor));
+                    assert!(range.end <= total);
+                }
+            }
+        }
+    }
 }

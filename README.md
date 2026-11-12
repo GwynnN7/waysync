@@ -1,128 +1,320 @@
 # Waysync
 
-**Waysync** is a declarative dotfile and package manager for Arch-based Linux distributions. It provides a full-screen interactive TUI to manage system packages (native Arch packages, AUR packages via `paru`, and local `PKGBUILD`s), deploy dotfiles with SHA256 conflict detection, and switch between desktop environments or shells (such as `caelestia`, `noctalia`, GNOME, or KDE) using per-file overrides.
+Waysync manages dotfiles and packages on Arch-based Linux systems. Choose the components you want, select an environment and an independent **Desktop / Laptop** device profile, then apply the configuration from one Git repository.
 
-## Quick Installation
+- Merge shared, environment, device, and device-plus-environment files.
+- Install native, AUR (`aur:`), and local `PKGBUILD` (`local:`) packages.
+- Review local file conflicts with a diff before overwriting them.
+- Capture edits from deployed `ask = true` components back into your authoring checkout.
+- Restore manually removed managed packages on the next sync.
+- Check a repository without installing packages, running hooks, or changing files.
+- Use a keyboard-driven terminal UI or explicit CLI commands.
 
-Install `waysync` directly via `curl | bash`:
+## Install
+
+Requires an Arch-based distribution, Git, Rust 1.89+, and the `base-devel` tools for package builds. Waysync bootstraps `paru-bin` from the AUR when package installation first needs it. Run Waysync as your normal user; privileged steps request `sudo`.
+
+From this checkout:
+
+```bash
+cargo build --release --locked
+sudo install -Dm755 target/release/waysync /usr/local/bin/waysync
+waysync init https://github.com/GwynnN7/dotfiles.git
+waysync check --all
+waysync
+```
+
+Or use the installer, optionally passing your dotfiles repository:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GwynnN7/waysync/main/install.sh | bash
-```
-
-Install `waysync` and initialize your dotfiles repository in a single command:
-
-```bash
+# Initialize at the same time:
 curl -fsSL https://raw.githubusercontent.com/GwynnN7/waysync/main/install.sh | bash -s -- https://github.com/GwynnN7/dotfiles.git
 ```
 
-## CLI Usage
+`init` clones and validates the manifest. It offers environment and device choices in a terminal, but does not install components or deploy files. Without a terminal it initializes with both choices unset.
 
-| Command | Description |
-| :--- | :--- |
-| `waysync init <url>` | Clone your dotfiles repository into `~/.local/share/waysync/repo` and initialize state. |
-| `waysync` | Launch the full-screen interactive TUI menu. |
-| `waysync env` | Switch the active environment (or select `none` for global-only) and configure environment-bound components. |
-| `waysync update` | Pull the latest changes from your dotfiles repository and sync enabled components. |
-| `waysync status` | Display the current repository, active environment, and deployed component status. |
+Only use dotfiles repositories you trust: installing packages evaluates their build recipes, and manifest hooks are shell commands.
 
-When launched without a command, Waysync refreshes the dotfiles repository before opening the menu. If the remote cannot be reached, it opens the menu using the local copy instead.
+## Everyday use
 
-### Interactive TUI Controls
+| Command | Behavior |
+| --- | --- |
+| `waysync` | Open the menu using the local checkout. |
+| `waysync init <url>` | Initialize a managed dotfiles checkout. Local Git paths also work. |
+| `waysync env` | Choose an environment, including `none`. |
+| `waysync env caelestia` | Select a named environment; newly available components may prompt. |
+| `waysync device` | Choose Desktop, Laptop, or `none`. |
+| `waysync device laptop` | Select Laptop while keeping the environment. |
+| `waysync device none` | Clear device-specific configuration. |
+| `waysync deploy` | Deploy dotfiles for installed, enabled components and run `post_deploy`. No packages. |
+| `waysync deploy --no-hooks` | Deploy dotfiles only; skip all hooks and package operations. |
+| `waysync deploy fish` | Deploy only the named installed component(s). |
+| `waysync sync` | Reconcile saved choices and actual package presence: restore missing packages, install new components, remove disabled ones, and deploy retained components. No pull or forced package refresh. |
+| `waysync install fish` | Install packages and files, run setup hooks, and enable the component. |
+| `waysync uninstall fish` | Remove unshared packages and unchanged managed files, then disable the component. |
+| `waysync capture --repo ~/Projects/dotfiles --dry-run` | Preview deployed edits to capture into your authoring checkout. |
+| `waysync capture --repo ~/Projects/dotfiles` | Review and copy edits; remember the checkout for later captures. |
+| `waysync capture --yes` | Copy nonconflicting edits into the remembered checkout without prompts. |
+| `waysync reinstall fish` | Force package reinstall/builds only; omit names for all enabled, installed components. |
+| `waysync update` | Pull with `--ff-only` and validate the manifest. No packages, files, or hooks. |
+| `waysync status` | Show profile, enabled components, and tracked file counts. |
+| `waysync check` | Check all components available to the active profile, including optional ones. |
+| `waysync check --all` | Check all environments with unset, Desktop, and Laptop devices. |
+| `waysync check --repo ~/Projects/dotfiles --all` | Check another local checkout without initializing it. |
 
-**Categories View:**
-* `Up` / `Down` (or `j` / `k`): Navigate items.
-* `Space`: Toggle an entire category on or off (if partially enabled, pressing `Space` enables all components in that category).
-* `Enter` (or `Right` / `l`): Open a category to toggle individual components, or trigger `Save & Apply`.
-* `Esc` / `q`: Cancel or exit.
+`waysync shell` remains an alias for `waysync env`.
 
-**Component View (Inside a Category):**
-* `Up` / `Down` (or `j` / `k`): Navigate components.
-* `Space`: Toggle the selected component.
-* `a`: Toggle all components in the current category.
-* `Enter` / `Esc` / `Left` / `h` / `q`: Return to the Categories view.
+Opening the menu does **not** pull or modify the checkout. Repository updates never clean build output or restore local edits automatically. Resolve Git conflicts or local changes yourself, then retry.
 
-## Dotfiles Repository Structure
+### Terminal UI
 
-waysync expects your dotfiles repository to contain `manifest.toml` at the root alongside `dotfiles/`, and optionally `overrides/` and `packages/`:
+The main menu shows the active environment and device. Component and category lists scroll to keep the selected row visible.
 
-```text
-my-dotfiles-repo/
-├── manifest.toml          # Declarative configuration of environments & components
-├── dotfiles/              # Base/global dotfiles (files and directories)
-├── overrides/             # Optional environment-specific file overrides
-│   └── <environment>/
-└── packages/              # Optional local PKGBUILDs (referenced as "local:<name>")
-    ├── shell/
-    │   └── PKGBUILD
-    └── kdeconnect/
-        └── PKGBUILD
+| View | Keys |
+| --- | --- |
+| Any list | `↑` / `↓` or `k` / `j` to move; `Enter` to choose; `Esc` / `q` to leave. |
+| Categories | `Space` toggles the category; `Enter` / `l` opens its components. |
+| Components | `Space` toggles one; `a` toggles all matches; `/` filters by name; `Enter` / `Esc` / `h` goes back. |
+| Status | `↑` / `↓` scrolls; `Enter` / `Esc` returns. |
+
+**Manage Components** starts with remembered choices, or `default` for new components. **Apply Selection** is a system operation, not just a preference save. New selections install packages and files; unchecked installed components are uninstalled; retained selections restore any missing packages and deploy their files without forcing upgrades or rebuilds. The confirmation names the removals.
+
+**Install Components** offers components Waysync has not installed. **Uninstall Components** offers tracked installed components. Both perform real system/file changes and update Waysync's tracking. Both change the system; neither is a bookkeeping-only action.
+
+**Reinstall Packages** is a separate action for installed components with packages. The old reinstall checkbox is gone: forcing package installation has no purpose in file deployment or uninstall. It does not deploy files, run hooks, or change component choices. The Deploy Dotfiles action asks whether to run deployment hooks; answer No for file copying only.
+
+### Action boundaries
+
+“Installed” means recorded as installed by Waysync, including components with no packages. Packages installed outside Waysync are not automatically enrolled. Installing a component adopts it into management; already present packages are skipped with `--needed`.
+
+| Action | Packages | Dotfiles | Hooks | Component choices / installation tracking |
+| --- | --- | --- | --- | --- |
+| Deploy dotfiles | None | Enabled, installed components | `post_deploy` only | Unchanged; file hashes/ownership updated |
+| Deploy with `--no-hooks` | None | Enabled, installed components | None | Unchanged; file hashes/ownership updated |
+| Manage → Apply Selection / `sync` | Install new components, restore missing packages, remove deselected ones | Selected components | `post_install` for new installs, then `post_deploy` | Updated to reflect applied selection |
+| Install components | Install missing packages | Selected components | New-install setup, then deployment hooks | Enable and record installation |
+| Uninstall components | Remove packages unclaimed by retained components | Remove unchanged tracked files | None | Disable and clear installation tracking |
+| Reinstall packages | Force reinstall/rebuild | None | None | Unchanged |
+| Update repository | None | None | None | Unchanged; only the Git checkout changes |
+| Capture local changes | None | Copy deployed edits back into the authoring checkout | None | Remember checkout; deployment baselines and choices unchanged |
+
+With an unchanged selection, **Manage → Apply Selection** also audits package presence, restores missing packages, and retries incomplete setup and cleanup. Use **Deploy Dotfiles** when you want to skip package checks entirely. Updating the repository is always separate. Use `waysync update` followed by `waysync deploy` for the common “get the new configs, then apply them” workflow.
+
+For native repository packages, reinstall uses `paru -S` without `--needed`. For AUR packages it also requests `--rebuild`; `local:` recipes use `paru -Ui --rebuild` in a fresh build directory. Plain package names can resolve to either native or AUR packages. Reinstall is a repair/rebuild operation, not a full system upgrade. Waysync does not refresh the system package databases or perform `-Syu` on your behalf. If packages were manually removed outside Waysync, sync automatically restores the missing specs. Use Uninstall Components / `waysync uninstall` to remove them from management so later syncs leave them removed.
+
+Operations run on the normal terminal so logs stay in scrollback. Errors remain visible and you can return to the menu.
+
+## Capture deployed edits into your authoring checkout
+
+Your managed checkout and your working Git checkout can be separate. For example, Waysync can deploy from `~/.local/share/waysync/repo` while you commit from `~/Projects/dotfiles`:
+
+```bash
+# Preview all tracked deployed file edits in components with ask = true:
+waysync capture --repo ~/Projects/dotfiles --dry-run
+# Review each diff and copy the edits you approve:
+waysync capture --repo ~/Projects/dotfiles
+# The path is remembered; later runs can omit --repo:
+waysync capture
+# Batch copy only changes without conflicting checkout edits:
+waysync capture --yes
 ```
 
-Waysync builds local PKGBUILDs in a disposable temporary directory, so source
-checkouts, `.SRCINFO`, and package archives never dirty the managed dotfiles
-repository. On the next repository refresh, it also removes leftovers created
-by older versions. A PKGBUILD whose only local difference is its `pkgver=` line
-is treated as generated and restored before pulling; any other local PKGBUILD
-edit is left intact and Git will still ask you to resolve it.
+The TUI has **Capture Local Changes** with an authoring-checkout prompt. Capture uses the **component's** `ask = true`, not the file's `check` flag. It handles single files and individual files from merged directories. Each file returns to its original repository-relative source: shared edits go to `dotfiles/`, environment edits to `overrides/`, and device edits to their device layer. It never flattens an override into a shared file. Older deployments without recorded source paths use the current manifest mapping; uncertain or changed mappings are reported and skipped.
 
-### How Overrides Work (`dotfiles/` vs `overrides/<env>/`)
+Capture compares the deployed contents and authoring contents against the last deployment hash. It skips unchanged deployed files and edits already present in the checkout. If both versions changed, interactive mode asks before replacing the checkout file; `--yes` skips such conflicts. Use `--yes --force` only when you explicitly want the deployed edit to replace conflicting checkout edits. Skipped paths produce a nonzero exit status with diagnostics; successfully copied files remain copied.
 
-When an environment (e.g., `caelestia` or `noctalia`) is active, waysync resolves every `[[components.files]]` entry as follows:
+The authoring directory must be a Git checkout root with a compatible manifest and source layout. Existing source permissions are preserved. Source symlinks, ambiguous routes, and files changed during review are refused. Missing deployed files are reported, not treated as deletions. Untracked/generated files and external `repo:` checkouts are excluded. Capture copies file contents; it does not import deployed permission changes.
 
-1. **Single File (`src = "starship.toml"`):** waysync checks if `overrides/<env>/starship.toml` exists. If found, it deploys that override; otherwise, it falls back to `dotfiles/starship.toml`.
-2. **Directory (`src = "hypr"`):** waysync scans `dotfiles/hypr/` first and then merges `overrides/<env>/hypr/` over it. Files are selected by relative path—so `overrides/noctalia/hypr/hyprland.conf` replaces `dotfiles/hypr/hyprland.conf`, while base-only and override-only files are both deployed.
-3. **Switching Environments:** Running `waysync env` removes only old-environment packages that are not claimed by another enabled component, without recursively removing their dependencies; it also undeploys old files, installs the new environment's components, and updates only enabled global components whose effective files or environment-scoped hooks change. Unrelated global components are not re-deployed. An affected component with `ask = true` still requires confirmation before it is updated.
+Nothing is staged, committed, or pushed, and no hooks or package managers run. Capture does not alter deployment hashes or the managed checkout when writing to a separate authoring checkout. Review and push normally, then refresh the managed checkout before applying again:
 
-### Per-file Environment Scope
+```bash
+git -C ~/Projects/dotfiles diff
+git -C ~/Projects/dotfiles add <reviewed-files>
+git -C ~/Projects/dotfiles commit -m "Update configuration"
+git -C ~/Projects/dotfiles push
+waysync update
+waysync deploy
+```
 
-Use `environments` on a component, `[[components.files]]` entry, or scoped hook when it should apply to one or more environments. For example, `environments = ["caelestia", "noctalia"]` makes the entry active in either environment. Omit it for a global entry. On an environment change, Waysync keeps components that apply to both environments in place, updates affected enabled global components, and removes files that no longer apply. Existing `environment = "name"` entries remain accepted for compatibility.
+Until that refresh, the managed checkout still has the old content; a deployment may correctly show a local conflict. Capture deliberately keeps the old baseline so it cannot silently overwrite your captured edits with that old version.
 
-This scope applies only to a file entry. Packages and hooks remain component-level; keep those in an environment-specific component when they must not run or install globally.
+## Package dependencies and module removal
 
-> **Note on External Git Repositories (`repo:<user>/<repo>`):**
-> Entries using `src = "repo:<user>/<repo>"` are cloned and updated directly from GitHub into their target `dest` directories. They do not need to be stored inside `dotfiles/`.
+There is no separate `requirements` array. Keep each kind of requirement at its owning layer:
 
-## Manifest Schema Reference (`manifest.toml`)
+| Requirement | Declare it in |
+| --- | --- |
+| A program's normal runtime dependencies | The package / PKGBUILD `depends` |
+| Tools used only to build or test a local package | Its `makedepends` / `checkdepends` |
+| An optional integration you deliberately want installed | The component's `packages` |
+| Helpers used by your custom scripts, hooks, or config | The component's `packages` |
+
+Repository packages and local PKGBUILDs already describe package dependencies. Pacman/paru resolve those relationships; duplicating them in a Waysync field would create a second dependency graph to maintain. Optional dependencies are suggestions, not automatically selected software, so explicitly list any you rely on. A helper may appear in more than one component: each declaration is a retained claim, not a reason to install it twice.
+
+On uninstall, Waysync first protects direct package claims from retained modules. It then asks pacman/libalpm for a dependency-safe removal plan using `-R --unneeded --print`, and executes only that subset with `-R --unneeded`. This also protects transitive, versioned, and provided dependencies of installed packages outside Waysync. If every candidate is still needed, the module is disabled and its unchanged managed files are removed while those packages stay installed; this is successful cleanup, not a failed uninstall. All modules being removed together share one package transaction, so their ordering does not strand dependencies that could be removed together.
+
+No cascade, dependency-check bypass, recursive dependency removal, or automatic orphan purge is used. Chosen optional helpers and script dependencies still need explicit component package claims: pacman cannot infer dependencies from shell commands or dotfile contents. Packages retained for other software may later become ordinary orphans; Waysync leaves any subsequent cleanup to you.
+
+References: [PKGBUILD dependency fields](https://man.archlinux.org/man/PKGBUILD.5.en.html) and [pacman removal options](https://man.archlinux.org/man/pacman.8.en).
+
+## Missing package reconciliation
+
+`sync`, **Manage → Apply Selection**, explicit component installation, and profile changes audit packages for the installed components they reconcile. Waysync reads pacman's installed package list and resolves `local:` recipes in temporary directories so split-package outputs are checked by their actual names. A missing output rebuilds/reinstalls that recipe. Already present package specs are left alone; package database query errors stop the operation rather than triggering a mass reinstall.
+
+Restoration does not rerun `post_install` for an already managed component. Its normal deployment phase still runs `post_deploy`, unless that optional file update is skipped. `ask = true` controls file-update approval and capture eligibility; it does not exempt saved packages from restoration. Without a terminal, optional file updates are skipped while required package restoration still runs.
+
+Remove a component through Waysync to stop managing its packages. Deleting packages with pacman/paru alone leaves the saved selection enabled, so sync restores them. **Deploy Dotfiles**, including `waysync deploy` and `--no-hooks`, never queries or restores packages. Capture, repository refresh, checks, and status also keep their separate scopes.
+
+## Repository layout and device overrides
+
+Use one branch for both machines. Environments and devices describe independent choices; branches would duplicate shared configuration and multiply combinations.
+
+```text
+my-dotfiles/
+├── manifest.toml
+├── dotfiles/                               # Shared files
+├── overrides/
+│   └── caelestia/                          # Existing environment overrides
+├── devices/
+│   ├── desktop/
+│   │   ├── dotfiles/                       # Desktop overrides, any environment
+│   │   └── overrides/caelestia/             # Desktop + Caelestia overrides
+│   └── laptop/
+│       ├── dotfiles/                       # Laptop overrides, any environment
+│       └── overrides/caelestia/             # Laptop + Caelestia overrides
+└── packages/
+    └── my-package/PKGBUILD
+```
+
+For each `src`, the last existing layer wins:
+
+| Priority | Source root |
+| --- | --- |
+| 1 — base | `dotfiles/` |
+| 2 — environment | `overrides/<environment>/` |
+| 3 — device | `devices/<device>/dotfiles/` |
+| 4 — device + environment | `devices/<device>/overrides/<environment>/` |
+
+Directories merge **by relative file path**, in the same order. An override replaces a whole file, not individual TOML/JSON/Lua settings. Base-only and override-only files are both included. Unset axes omit their layers. Existing environment-only repositories work without adding any device files.
+
+For example, `src = "hypr"` and `dest = "$XDG_CONFIG_HOME/hypr"` can take shared keybindings from `dotfiles/hypr/`, shell bindings from `overrides/caelestia/hypr/`, and monitor settings from `devices/laptop/dotfiles/hypr/`.
+
+See the [complete small example](examples/dotfiles/manifest.toml). Manifests can be kept in one file or split into ordered component fragments as below.
+
+## Manifest
+
+For a larger repository, keep environment declarations in `manifest.toml` and split modules into domain files:
 
 ```toml
-# Optional: Define environments/shells. Omit if you only use global components.
+# manifest.toml — include is a root key, above [environments].
+include = ["components/00-shells.toml", "components/10-desktop.toml", "components/20-system.toml"]
+
+[environments]
+available = ["caelestia", "noctalia"]
+```
+
+Each fragment contains normal `[[components]]` entries. Files are loaded in the listed order; any components directly in the root come first. Includes are literal checkout-relative paths: no globs, nested includes, symlinks, or `..`. Define environments only in the root. Validation checks duplicate component names and scopes across the combined manifest and reports ignored fields in each fragment. Existing single-file manifests still work.
+
+A single-file example:
+
+```toml
 [environments]
 available = ["caelestia", "noctalia"]
 
 [[components]]
-name = "hypr"                          # Unique component identifier
-category = "wm"                        # Menu category (defaults to "general")
-default = true                         # Checked by default on first run (default: false)
-ask = true                             # Ask before updating an installed component (default: false)
-environments = ["caelestia", "noctalia"] # Optional: bind component to one or more environments
-packages = [
-    "hyprland",                        # Native Arch or AUR package (installed via paru)
-    "local:my-custom-pkg",             # Local PKGBUILD in packages/my-custom-pkg/PKGBUILD
-]
-post_install = [                       # Shell commands run ONLY when newly enabled
-    "hyprctl reload >/dev/null",
-]
-post_deploy = [                        # Shell commands run after every dotfile deployment
-    "hyprctl reload >/dev/null",
+name = "hyprland"                 # Unique identifier; keep stable for state tracking
+category = "wm"                   # Default: general
+default = true                   # Default: false; used only before a choice is saved
+ask = false                       # Ask before updating an installed component
+packages = ["hyprland", "aur:some-package", "local:my-package"]
+
+# Hooks belong HERE, before [[components.files]].
+post_install = ["printf 'First deployment completed\\n'"]
+post_deploy = [
+  { cmd = "hyprctl reload", environments = ["caelestia", "noctalia"] },
 ]
 
 [[components.files]]
-src = "hypr"                           # Path in dotfiles/ (or overrides/<env>/), OR "repo:user/repo"
-dest = "$XDG_CONFIG_HOME/hypr"         # Destination path (supports env vars)
-sudo = false                           # Copy/remove using sudo (default: false)
-check = true                           # Prompt with diff if modified locally (default: true)
-environments = ["caelestia", "noctalia"] # Optional: deploy this file only in these environments
+src = "hypr"
+dest = "$XDG_CONFIG_HOME/hypr"
+sudo = false                      # Default: false
+check = true                      # Default: true; false allows unconditional overwrite
+
+[[components]]
+name = "laptop-power"
+category = "hardware"
+devices = ["laptop"]
+default = false
+packages = ["power-profiles-daemon"]
+
+[[components.files]]
+src = "power/settings.conf"
+dest = "$XDG_CONFIG_HOME/power/settings.conf"
+devices = ["laptop"]
+environments = ["caelestia", "noctalia"]
 ```
 
-### Supported Environment Variables in `dest`
+Remove the example package names and supply the referenced source files before using this snippet. `waysync check` will report missing local recipes and source files; it does not check whether remote packages/repositories exist.
 
-waysync expands any environment variable set in your current session and provides built-in fallbacks for standard XDG variables:
+`environments` and `devices` are supported on components, file entries, and scoped hooks. Both scopes must match when both are present. Omitted or empty lists apply to all values of that axis. A scope on a **file** controls only that file, not its component's packages or hooks. Use a scoped **component** for device-specific packages.
 
-* `$HOME` -> `/home/<user>`
-* `$XDG_CONFIG_HOME` -> `$HOME/.config`
-* `$XDG_DATA_HOME` -> `$HOME/.local/share`
-* `$XDG_STATE_HOME` -> `$HOME/.local/state`
-* `$XDG_CACHE_HOME` -> `$HOME/.cache`
-* `$XDG_BIN_HOME` -> `$HOME/.local/bin`
-* `$XDG_CONFIG_SERVICE` -> `$HOME/.config/systemd/user`
+Legacy `environment = "name"`, `shell = "name"`, and `[shells]` remain accepted. Environment names must be declared in `available`. Devices are built-in lowercase values: `desktop` and `laptop`; no `[devices]` section is needed.
+
+### Hooks and external repositories
+
+- `post_install` runs after files are deployed when a component is newly installed or reactivated. A failed installation hook is retried on the next sync.
+- `post_deploy` runs after every deployment of that component.
+- Retained components on a profile switch run only applicable `post_deploy` hooks. Use these for environment/device activation work; `post_install` is reserved for installing or reactivating a component. Reinstall Packages does not invoke either hook phase.
+- Hooks run through `sh -c` from the repository root, with `WAYSYNC_REPO_DIR`, `WAYSYNC_ENV`, and `WAYSYNC_DEVICE` set. Unset axes are empty strings.
+- A failed hook stops the operation and reports the failure. For deliberately optional commands, handle the expected failure explicitly, for example `hyprctl reload || true` when running outside a session.
+- `src = "repo:owner/project"` clones a GitHub repository into `dest` or pulls an existing checkout. It bypasses override layers, does not support `sudo`, and the checkout is preserved on uninstall to protect user work.
+
+In TOML, keys after `[[components.files]]` belong to that file table until another table starts. Put component hooks before the first file table. `check` reports ignored keys and misplaced hooks and exits nonzero for any finding.
+
+### Destination paths
+
+Destinations must expand to absolute paths. Waysync supports `~/`, `$VAR`, `${VAR}`, and `${VAR:-fallback}`. Unset variables without fallbacks, `..`, broad roots such as `$HOME` or `/etc`, and overlap with Waysync's own files are rejected.
+
+| Variable | Fallback |
+| --- | --- |
+| `$HOME` | Current home directory |
+| `$XDG_CONFIG_HOME` | `$HOME/.config` |
+| `$XDG_DATA_HOME` | `$HOME/.local/share` |
+| `$XDG_STATE_HOME` | `$HOME/.local/state` |
+| `$XDG_CACHE_HOME` | `$HOME/.cache` |
+| `$XDG_BIN_HOME` | `$HOME/.local/bin` |
+| `$XDG_CONFIG_SERVICE` | `$XDG_CONFIG_HOME/systemd/user` |
+
+Dotfile sources must be regular files or directories inside the checkout. Source symlinks are rejected. Files are copied, preserving executable permissions; they are not symlinked into your home.
+
+## Switching and recovering
+
+A profile switch removes components that no longer apply, offers newly available components, and updates enabled retained components whose resolved files or scoped hooks change. It keeps the environment when changing device and the device when changing environment. Choices for inactive components are remembered for the next switch. Unrelated components are left alone.
+
+Packages shared by retained components or required by other installed packages are protected. Removal uses `pacman -R --unneeded`, without recursively removing dependencies; packages still needed by other software are kept. Local builds and package metadata evaluation use disposable copies, leaving the managed checkout intact.
+
+Conflicting local files default to **Keep local**. A pre-existing file you keep is not claimed by Waysync. On removal or when an old override disappears, unchanged tracked files are deleted; locally modified or unverified paths and external Git checkouts are preserved. Empty directories may remain. A saved `.new` file is also retained and never silently overwritten.
+
+Files and package operations cannot form one atomic transaction. State is atomically replaced after each component and on recoverable errors, and a process lock prevents simultaneous modifying operations. Successful work remains applied if a later step fails. Fix the problem and use `waysync sync` to resume. Run `waysync update` first if you also want a pull, then explicitly deploy or sync. State records per-component progress; an abrupt kill or power loss during a component may require reviewing its files before retrying.
+
+The managed checkout lives at `$XDG_DATA_HOME/waysync/repo`; state lives at `$XDG_STATE_HOME/waysync/state.toml`. Existing state is migrated on the next modifying operation. Back up that file before upgrading; older Waysync versions do not understand device profiles or the newer installation tracking.
+
+`status` reports tracked state, not a live audit of installed packages or file contents. `check` validates local inputs and destination collisions without executing hooks, package recipes, package managers, or Git network requests. With `--all`, optional components are checked too, so alternative components sharing destinations may need separate scopes.
+
+## Development
+
+```bash
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo run --locked -- check --repo examples/dotfiles --all
+```
+
+Tests use temporary repositories and configuration directories. They cover scope combinations, override precedence, profile switches, conflicts, ownership and cleanup, failure checkpoints, legacy state, validation, menu scrolling, capture routing/conflicts, manifest fragments, dependency-safe batch removal, package restoration, and action boundaries (using fake package tools). They do not install system packages or deploy into your real home.
+
+## AI usage
+
+AI language models assisted with Waysync's development, including code generation, tests, and documentation.
+
+Licensed under [GPL-3.0](LICENSE).

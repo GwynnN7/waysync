@@ -1,330 +1,518 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use console::style;
 use dialoguer::Select;
-use similar::{ChangeTag, TextDiff};
+use similar::TextDiff;
 
 use crate::config::AppConfig;
-use crate::manifest::{Component, FileEntry};
+use crate::manifest::{Component, FileEntry, Manifest};
+use crate::profile::Profile;
 use crate::state::State;
 use crate::utils::{
-    collect_directory_files, copy_file, expand_env, hash_contents, read_file_contents,
+    collect_directory_files, copy_file, destination_path, hash_contents, read_file_contents,
     remove_path, resolve_file_source, FileSource,
 };
 
-/// Deploy all files for a component.
-pub fn deploy_component_files(
-    component: &Component,
-    config: &AppConfig,
-    state: &mut State,
-    active_shell: Option<&str>,
-) -> Result<()> {
-    let mut deployed_files: Vec<String> = Vec::new();
-
-    for file in component
-        .files
-        .iter()
-        .filter(|file| file.applies_to_environment(active_shell))
-    {
-        let mut file_deployed = deploy_file_entry(file, config, state, active_shell)?;
-        deployed_files.append(&mut file_deployed);
-    }
-
-    state
-        .deployed
-        .insert(component.name.clone(), deployed_files);
-    Ok(())
+pub struct PlannedFile<'a> {
+    pub source: FileSource,
+    pub dest: PathBuf,
+    pub entry: &'a FileEntry,
 }
 
-/// Deploy a single file entry. Returns the list of deployed destination paths.
-fn deploy_file_entry(
-    file: &FileEntry,
+/// Resolve everything before touching packages, hooks, or destinations.
+pub fn plan_component<'a>(
+    component: &'a Component,
     config: &AppConfig,
-    state: &mut State,
-    active_shell: Option<&str>,
-) -> Result<Vec<String>> {
-    let dest_expanded = expand_env(&file.dest);
-    let dest = PathBuf::from(&dest_expanded);
-    let source = resolve_file_source(&file.src, config, active_shell);
-
-    match source {
-        FileSource::Repo(url) => {
-            // Destination must be a directory for repo sources
-            if dest.exists() && dest.is_file() {
+    profile: Profile<'_>,
+) -> Result<Vec<PlannedFile<'a>>> {
+    let mut planned = Vec::new();
+    for entry in component
+        .files
+        .iter()
+        .filter(|file| file.applies_to(profile))
+    {
+        let dest = destination_path(&entry.dest)?;
+        for protected in [&config.repo_dir, &config.state_dir] {
+            if dest.starts_with(protected) || protected.starts_with(&dest) {
                 bail!(
-                    "Destination for repo source must be a directory, not a file: {}",
+                    "Destination overlaps Waysync's own files: {}",
                     dest.display()
                 );
             }
-            if dest.exists() {
-                crate::repo::pull_repo(&dest)?;
-            } else {
-                crate::repo::clone_repo(&url, &dest)?;
-            }
-            Ok(vec![dest_expanded])
         }
-        FileSource::Local(src_path) => {
-            if !src_path.exists() {
-                bail!("Source not found: {}", src_path.display());
-            }
-
-            if src_path.is_dir() {
-                deploy_directory(&file.src, &dest, file, config, state, active_shell)
-            } else {
-                deploy_single_file(&src_path, &dest, file, state)?;
-                Ok(vec![dest.to_string_lossy().to_string()])
+        match resolve_file_source(&entry.src, config, profile) {
+            FileSource::Repo(url) => planned.push(PlannedFile {
+                source: FileSource::Repo(url),
+                dest,
+                entry,
+            }),
+            FileSource::Local(source) => {
+                let metadata = std::fs::symlink_metadata(&source).with_context(|| {
+                    format!(
+                        "Component '{}': source not found: {}",
+                        component.name,
+                        source.display()
+                    )
+                })?;
+                if !source
+                    .canonicalize()?
+                    .starts_with(config.repo_dir.canonicalize()?)
+                {
+                    bail!("Source escapes the dotfiles checkout: {}", source.display());
+                }
+                if metadata.file_type().is_symlink() {
+                    bail!("Symlink sources are unsupported: {}", source.display());
+                }
+                if metadata.is_dir() {
+                    for (source, relative) in collect_directory_files(&entry.src, config, profile)?
+                    {
+                        planned.push(PlannedFile {
+                            source: FileSource::Local(source),
+                            dest: dest.join(relative),
+                            entry,
+                        });
+                    }
+                } else if metadata.is_file() {
+                    planned.push(PlannedFile {
+                        source: FileSource::Local(source),
+                        dest,
+                        entry,
+                    });
+                } else {
+                    bail!(
+                        "Source must be a regular file or directory: {}",
+                        source.display()
+                    );
+                }
             }
         }
     }
+    Ok(planned)
 }
 
-/// Deploy a directory with environment override merging.
-fn deploy_directory(
-    src_key: &str,
-    dest: &Path,
-    file: &FileEntry,
+pub fn preflight(
+    manifest: &Manifest,
     config: &AppConfig,
-    state: &mut State,
-    active_shell: Option<&str>,
-) -> Result<Vec<String>> {
-    let files = collect_directory_files(src_key, config, active_shell)?;
-    let mut deployed = Vec::new();
-
-    for (source_path, relative) in &files {
-        let file_dest = dest.join(relative);
-        deploy_single_file(source_path, &file_dest, file, state)?;
-        deployed.push(file_dest.to_string_lossy().to_string());
-    }
-
-    Ok(deployed)
-}
-
-/// Deploy a single file with diff checking.
-fn deploy_single_file(
-    src: &Path,
-    dest: &Path,
-    file: &FileEntry,
-    state: &mut State,
+    profile: Profile<'_>,
+    names: &HashSet<&str>,
 ) -> Result<()> {
-    let src_contents = std::fs::read(src)?;
-    let src_hash = hash_contents(&src_contents);
-    let dest_key = dest.to_string_lossy().to_string();
+    preflight_inner(manifest, config, profile, names, true)
+}
 
-    if dest.exists() && file.check {
-        let dest_contents = read_file_contents(dest, file.sudo)?;
-        let dest_hash = hash_contents(&dest_contents);
+pub fn preflight_files(
+    manifest: &Manifest,
+    config: &AppConfig,
+    profile: Profile<'_>,
+    names: &HashSet<&str>,
+) -> Result<()> {
+    preflight_inner(manifest, config, profile, names, false)
+}
 
-        // Check if local file was modified since last deploy AND differs from upstream
-        let last_deployed_hash = state.hashes.get(&dest_key).cloned();
-
-        let local_modified = match &last_deployed_hash {
-            Some(h) => *h != dest_hash,
-            None => true, // No record = assume potentially modified
-        };
-
-        if local_modified && dest_hash != src_hash {
-            // Conflict: local file modified AND upstream changed
-            println!(
-                "\n  {} has been modified locally",
-                style(dest.display()).yellow()
-            );
-            show_diff(&dest_contents, &src_contents, dest);
-
-            match prompt_diff_action()? {
-                DiffAction::Overwrite => {
-                    copy_file(src, dest, file.sudo)?;
-                    state.hashes.insert(dest_key, src_hash);
-                }
-                DiffAction::KeepLocal => {
-                    // Remove baseline hash so future syncs still know this file was modified locally
-                    state.hashes.remove(&dest_key);
-                }
-                DiffAction::KeepLocalCopyNew => {
-                    let new_path = PathBuf::from(format!("{}.new", dest.display()));
-                    copy_file(src, &new_path, file.sudo)?;
-                    state.hashes.remove(&dest_key);
+fn preflight_inner(
+    manifest: &Manifest,
+    config: &AppConfig,
+    profile: Profile<'_>,
+    names: &HashSet<&str>,
+    check_packages: bool,
+) -> Result<()> {
+    let mut destinations: HashMap<PathBuf, &str> = HashMap::new();
+    for component in manifest
+        .components_for_profile(profile)
+        .into_iter()
+        .filter(|c| names.contains(c.name.as_str()))
+    {
+        for file in plan_component(component, config, profile)? {
+            for (other, owner) in &destinations {
+                if file.dest.starts_with(other) || other.starts_with(&file.dest) {
+                    bail!(
+                        "Conflicting destinations for '{}' and '{}': {} and {}",
+                        owner,
+                        component.name,
+                        other.display(),
+                        file.dest.display()
+                    );
                 }
             }
-            return Ok(());
+            destinations.insert(file.dest, &component.name);
         }
-
-        // If hashes match (no change upstream or locally), skip
-        if dest_hash == src_hash {
-            state.hashes.insert(dest_key, src_hash);
-            return Ok(());
-        }
-    }
-
-    // No conflict or check=false: just copy
-    copy_file(src, dest, file.sudo)?;
-    state.hashes.insert(dest_key, src_hash);
-    Ok(())
-}
-
-/// Show a unified diff between local and upstream content.
-fn show_diff(local: &[u8], upstream: &[u8], path: &Path) {
-    let local_str = String::from_utf8_lossy(local);
-    let upstream_str = String::from_utf8_lossy(upstream);
-
-    let diff = TextDiff::from_lines(local_str.as_ref(), upstream_str.as_ref());
-
-    println!("  --- {} (local)", path.display());
-    println!("  +++ {} (upstream)", path.display());
-
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Delete => print!("  {}{}", style("-").red(), style(&change).red()),
-            ChangeTag::Insert => print!("  {}{}", style("+").green(), style(&change).green()),
-            ChangeTag::Equal => print!("   {}", change),
-        }
-    }
-    println!();
-}
-
-enum DiffAction {
-    Overwrite,
-    KeepLocal,
-    KeepLocalCopyNew,
-}
-
-fn prompt_diff_action() -> Result<DiffAction> {
-    let choices = &[
-        "Overwrite with upstream version",
-        "Keep local version",
-        "Keep local, save upstream as .new",
-    ];
-    let selection = Select::new()
-        .with_prompt("How to resolve?")
-        .items(choices)
-        .default(0)
-        .interact()?;
-    Ok(match selection {
-        0 => DiffAction::Overwrite,
-        1 => DiffAction::KeepLocal,
-        _ => DiffAction::KeepLocalCopyNew,
-    })
-}
-
-/// Check if a file path requires sudo based on the component's file entries.
-fn path_needs_sudo(component: &Component, file_path: &str) -> bool {
-    component.files.iter().any(|f| {
-        let dest = expand_env(&f.dest);
-        file_path.starts_with(&dest) && f.sudo
-    })
-}
-
-/// Clean up empty parent directories up to safe system/user boundaries.
-fn cleanup_empty_parents(file_path: &Path, sudo: bool) {
-    let protected: HashSet<PathBuf> = [
-        "/",
-        "/etc",
-        "/etc/sudoers.d",
-        "/etc/sddm.conf.d",
-        "/usr",
-        "/usr/bin",
-        "/usr/lib",
-        "/usr/local",
-        "/usr/local/bin",
-        "/usr/share",
-        &expand_env("$HOME"),
-        &expand_env("$XDG_CONFIG_HOME"),
-        &expand_env("$XDG_DATA_HOME"),
-        &expand_env("$XDG_STATE_HOME"),
-        &expand_env("$XDG_CACHE_HOME"),
-        &expand_env("$XDG_BIN_HOME"),
-        &expand_env("$XDG_CONFIG_SERVICE"),
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .collect();
-
-    let mut parent = file_path.parent();
-    while let Some(dir) = parent {
-        if protected.contains(dir) || !dir.exists() {
-            break;
-        }
-
-        let removed = if sudo {
-            Command::new("sudo")
-                .args(["rmdir", "--ignore-fail-on-non-empty"])
-                .arg(dir)
-                .status()
-                .map(|s| s.success() && !dir.exists())
-                .unwrap_or(false)
-        } else {
-            std::fs::remove_dir(dir).is_ok()
-        };
-
-        if removed {
-            parent = dir.parent();
-        } else {
-            break;
-        }
-    }
-}
-
-/// Remove all deployed files for a component.
-pub fn undeploy_component_files(component: &Component, state: &mut State) -> Result<()> {
-    if let Some(files) = state.deployed.remove(&component.name) {
-        for file_path in &files {
-            let path = PathBuf::from(file_path);
-            let needs_sudo = path_needs_sudo(component, file_path);
-            if path.exists() {
-                if let Err(e) = remove_path(&path, needs_sudo) {
-                    eprintln!("  Warning: failed to remove {}: {}", path.display(), e);
+        for spec in component.packages.iter().filter(|_| check_packages) {
+            if let Some(name) = spec.strip_prefix("local:") {
+                let recipe = config.repo_dir.join("packages").join(name).join("PKGBUILD");
+                if !recipe.is_file() {
+                    bail!("Missing local PKGBUILD: {}", recipe.display());
                 }
             }
-            state.hashes.remove(file_path);
-            cleanup_empty_parents(&path, needs_sudo);
         }
     }
     Ok(())
 }
 
-/// Re-deploy a component's files, cleaning up orphaned files from the previous deployment.
+#[derive(Debug, PartialEq, Eq)]
+enum FileDeployment {
+    Written,
+    KeptManaged,
+    KeptUnmanaged,
+}
+
+/// Track each completed file immediately; callers checkpoint state even on error.
 pub fn redeploy_component_files(
     component: &Component,
     config: &AppConfig,
     state: &mut State,
-    active_shell: Option<&str>,
+    profile: Profile<'_>,
 ) -> Result<()> {
-    let old_deployed = state
+    let planned = plan_component(component, config, profile)?;
+    let old = state
         .deployed
         .get(&component.name)
         .cloned()
         .unwrap_or_default();
-
-    // Deploy new files
-    deploy_component_files(component, config, state, active_shell)?;
-
-    // Find orphaned files (were deployed before but not in new deployment)
-    let new_deployed = state
-        .deployed
-        .get(&component.name)
-        .cloned()
-        .unwrap_or_default();
-    let new_set: HashSet<_> = new_deployed.iter().collect();
-
-    for old_file in &old_deployed {
-        if !new_set.contains(old_file) {
-            let path = PathBuf::from(old_file);
-            let needs_sudo = path_needs_sudo(component, old_file);
-            if path.exists() {
-                if let Err(e) = remove_path(&path, needs_sudo) {
-                    eprintln!(
-                        "  Warning: failed to remove orphaned file {}: {}",
-                        path.display(),
-                        e
-                    );
+    let mut desired = HashSet::new();
+    for file in planned {
+        let key = file.dest.to_string_lossy().into_owned();
+        desired.insert(key.clone());
+        let owned = match file.source {
+            FileSource::Repo(url) => {
+                if file.dest.exists() {
+                    crate::repo::pull_repo(&file.dest)?;
+                } else {
+                    crate::repo::clone_repo(&url, &file.dest)?;
                 }
+                // External checkouts can contain user work; never recursively remove them.
+                true
             }
-            state.hashes.remove(old_file);
-            cleanup_empty_parents(&path, needs_sudo);
+            FileSource::Local(source) => {
+                let outcome = deploy_single_file(&source, &file.dest, file.entry, state)?;
+                if outcome == FileDeployment::Written {
+                    let relative = source.strip_prefix(&config.repo_dir)?;
+                    state
+                        .sources
+                        .insert(key.clone(), relative.to_string_lossy().into_owned());
+                }
+                outcome != FileDeployment::KeptUnmanaged
+            }
+        };
+        if owned {
+            let tracked = state.deployed.entry(component.name.clone()).or_default();
+            if !tracked.contains(&key) {
+                tracked.push(key);
+            }
         }
     }
-
+    for orphan in old.iter().filter(|path| !desired.contains(*path)) {
+        release_file(component, orphan, state)?;
+    }
     Ok(())
+}
+
+fn deploy_single_file(
+    src: &Path,
+    dest: &Path,
+    entry: &FileEntry,
+    state: &mut State,
+) -> Result<FileDeployment> {
+    deploy_single_file_with_choice(src, dest, entry, state, || {
+        Select::new()
+            .with_prompt("Resolve file conflict")
+            .items(&[
+                "Keep local version",
+                "Overwrite with incoming version",
+                "Keep local, save incoming as .new",
+            ])
+            .default(0)
+            .interact()
+            .map_err(Into::into)
+    })
+}
+
+fn deploy_single_file_with_choice(
+    src: &Path,
+    dest: &Path,
+    entry: &FileEntry,
+    state: &mut State,
+    choice: impl FnOnce() -> Result<usize>,
+) -> Result<FileDeployment> {
+    let incoming = std::fs::read(src)?;
+    let incoming_hash = hash_contents(&incoming);
+    let key = dest.to_string_lossy().into_owned();
+    if dest.exists() && entry.check {
+        let local = read_file_contents(dest, entry.sudo)?;
+        let local_hash = hash_contents(&local);
+        if local_hash == incoming_hash {
+            state.hashes.insert(key, incoming_hash);
+            return Ok(FileDeployment::Written);
+        }
+        if state.hashes.get(&key) != Some(&local_hash) {
+            println!(
+                "\n  {} differs from the last deployed version",
+                style(dest.display()).yellow()
+            );
+            if let (Ok(local), Ok(incoming)) =
+                (std::str::from_utf8(&local), std::str::from_utf8(&incoming))
+            {
+                let diff = TextDiff::from_lines(local, incoming);
+                print!(
+                    "{}",
+                    diff.unified_diff()
+                        .context_radius(3)
+                        .header("local", "incoming")
+                );
+            } else {
+                println!(
+                    "  Binary content differs ({} local / {} incoming bytes).",
+                    local.len(),
+                    incoming.len()
+                );
+            }
+            let selection = choice()?;
+            if selection != 1 {
+                if selection == 2 {
+                    let new_path = dest.with_file_name(format!(
+                        "{}.new",
+                        dest.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    if new_path.exists() {
+                        bail!("Refusing to overwrite existing {}", new_path.display());
+                    }
+                    copy_file(src, &new_path, entry.sudo)?;
+                }
+                // Preserve the old baseline if managed; a kept pre-existing file is unowned.
+                return Ok(
+                    if state.deployed.values().any(|paths| paths.contains(&key)) {
+                        FileDeployment::KeptManaged
+                    } else {
+                        FileDeployment::KeptUnmanaged
+                    },
+                );
+            }
+        }
+    }
+    copy_file(src, dest, entry.sudo)?;
+    state.hashes.insert(key, incoming_hash);
+    Ok(FileDeployment::Written)
+}
+
+fn path_needs_sudo(component: &Component, path: &Path) -> bool {
+    component.files.iter().any(|file| {
+        file.sudo && destination_path(&file.dest).is_ok_and(|dest| path.starts_with(dest))
+    })
+}
+
+/// Preserve modified files, external repositories, and files another component owns.
+/// On a removal failure keep tracking and return the error so retry remains possible.
+fn release_file(component: &Component, key: &str, state: &mut State) -> Result<()> {
+    let shared = state
+        .deployed
+        .iter()
+        .any(|(name, files)| name != &component.name && files.iter().any(|file| file == key));
+    if !shared {
+        let path = Path::new(key);
+        let sudo = path_needs_sudo(component, path);
+        if path
+            .try_exists()
+            .with_context(|| format!("Cannot inspect {}", path.display()))?
+        {
+            let unchanged = if path.is_file() {
+                let contents = read_file_contents(path, sudo)?;
+                state.hashes.get(key) == Some(&hash_contents(&contents))
+            } else {
+                false
+            };
+            if unchanged {
+                remove_path(path, sudo)?;
+            } else {
+                println!("  Keeping modified or unverified path: {}", path.display());
+            }
+        }
+        state.hashes.remove(key);
+        state.sources.remove(key);
+    }
+    if let Some(files) = state.deployed.get_mut(&component.name) {
+        files.retain(|file| file != key);
+    }
+    Ok(())
+}
+
+pub fn undeploy_component_files(component: &Component, state: &mut State) -> Result<()> {
+    let files = state
+        .deployed
+        .get(&component.name)
+        .cloned()
+        .unwrap_or_default();
+    for file in files {
+        release_file(component, &file, state)?;
+    }
+    state.deployed.remove(&component.name);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{fixture, write};
+
+    fn component(dest: &Path) -> Component {
+        toml::from_str(&format!(
+            "name = 'test'\n[[files]]\nsrc = 'config'\ndest = '{}'\ncheck = false\n",
+            dest.display()
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn cleanup_preserves_modified_files_and_removes_only_unchanged_owned_files() {
+        let (root, config) = fixture();
+        let dest = root.path().join("dest");
+        write(config.dotfiles_dir().join("config/a"), "a");
+        write(config.dotfiles_dir().join("config/b"), "b");
+        let component = component(&dest);
+        let mut state = State::default();
+        redeploy_component_files(&component, &config, &mut state, Profile::default()).unwrap();
+        write(dest.join("b"), "my changes");
+        undeploy_component_files(&component, &mut state).unwrap();
+        assert!(!dest.join("a").exists());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("b")).unwrap(),
+            "my changes"
+        );
+        assert!(!state.deployed.contains_key("test"));
+        assert!(state.hashes.is_empty());
+    }
+
+    #[test]
+    fn switching_device_removes_obsolete_override_files_and_restores_base() {
+        let (root, config) = fixture();
+        let dest = root.path().join("dest");
+        write(config.dotfiles_dir().join("config/shared"), "base");
+        write(
+            config
+                .repo_dir
+                .join("devices/laptop/dotfiles/config/shared"),
+            "laptop",
+        );
+        write(
+            config
+                .repo_dir
+                .join("devices/laptop/dotfiles/config/laptop-only"),
+            "battery",
+        );
+        let component = component(&dest);
+        let mut state = State::default();
+        redeploy_component_files(
+            &component,
+            &config,
+            &mut state,
+            Profile {
+                environment: None,
+                device: Some(crate::profile::Device::Laptop),
+            },
+        )
+        .unwrap();
+        redeploy_component_files(
+            &component,
+            &config,
+            &mut state,
+            Profile {
+                environment: None,
+                device: Some(crate::profile::Device::Desktop),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("shared")).unwrap(),
+            "base"
+        );
+        assert!(!dest.join("laptop-only").exists());
+        assert_eq!(state.deployed["test"].len(), 1);
+    }
+
+    #[test]
+    fn shared_ownership_survives_removing_one_component() {
+        let (root, config) = fixture();
+        let dest = root.path().join("dest");
+        write(config.dotfiles_dir().join("config"), "value");
+        let component = component(&dest);
+        let mut state = State::default();
+        redeploy_component_files(&component, &config, &mut state, Profile::default()).unwrap();
+        state
+            .deployed
+            .insert("other".into(), vec![dest.to_string_lossy().into_owned()]);
+        undeploy_component_files(&component, &mut state).unwrap();
+        assert!(dest.exists());
+        assert!(state.hashes.contains_key(dest.to_str().unwrap()));
+    }
+
+    #[test]
+    fn failed_removal_preserves_tracking() {
+        let (root, config) = fixture();
+        let dest = root.path().join("dest");
+        write(config.dotfiles_dir().join("config"), "value");
+        let component = component(&dest);
+        let mut state = State::default();
+        redeploy_component_files(&component, &config, &mut state, Profile::default()).unwrap();
+        // An unreadable path (a symlink loop) produces an error without needing root.
+        std::fs::remove_file(&dest).unwrap();
+        std::os::unix::fs::symlink(&dest, &dest).unwrap();
+        // release_file uses try_exists, so failure cannot look like a missing file.
+        assert!(undeploy_component_files(&component, &mut state).is_err());
+        assert_eq!(
+            state.deployed["test"],
+            vec![dest.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_overlapping_component_destinations() {
+        let (root, config) = fixture();
+        write(config.dotfiles_dir().join("config"), "value");
+        let first = component(&root.path().join("dest"));
+        let mut second = first.clone();
+        second.name = "other".into();
+        let manifest = Manifest {
+            environments: None,
+            components: vec![first, second],
+        };
+        assert!(preflight(
+            &manifest,
+            &config,
+            Profile::default(),
+            &HashSet::from(["test", "other"])
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("Conflicting destinations"));
+    }
+}
+
+#[cfg(test)]
+mod conflict_tests {
+    use super::*;
+    use crate::test_support::{fixture, write};
+
+    #[test]
+    fn keeping_a_preexisting_local_file_does_not_claim_ownership() {
+        let (root, config) = fixture();
+        let source = config.dotfiles_dir().join("config");
+        let dest = root.path().join("dest");
+        write(&source, "incoming");
+        write(&dest, "mine");
+        let entry: FileEntry =
+            toml::from_str(&format!("src='config'\ndest='{}'", dest.display())).unwrap();
+        for choice in [0, 2] {
+            let mut state = State::default();
+            assert_eq!(
+                deploy_single_file_with_choice(&source, &dest, &entry, &mut state, || Ok(choice))
+                    .unwrap(),
+                FileDeployment::KeptUnmanaged
+            );
+            assert!(state.hashes.is_empty());
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), "mine");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dest.with_file_name("dest.new")).unwrap(),
+            "incoming"
+        );
+    }
 }

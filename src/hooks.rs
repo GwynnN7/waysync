@@ -1,20 +1,18 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::manifest::HookEntry;
+use crate::profile::Profile;
 
 pub fn run_hooks(
     hooks: &[HookEntry],
     label: &str,
-    active_env: Option<&str>,
+    profile: Profile<'_>,
     repo_dir: &Path,
 ) -> Result<()> {
-    let applicable: Vec<&HookEntry> = hooks
-        .iter()
-        .filter(|h| h.applies_to_environment(active_env))
-        .collect();
+    let applicable: Vec<&HookEntry> = hooks.iter().filter(|h| h.applies_to(profile)).collect();
 
     for (i, hook) in applicable.iter().enumerate() {
         let cmd_str = hook.cmd();
@@ -28,11 +26,19 @@ pub fn run_hooks(
         let status = Command::new("sh")
             .args(["-c", cmd_str])
             .env("WAYSYNC_REPO_DIR", repo_dir)
-            .env("WAYSYNC_ENV", active_env.unwrap_or(""))
+            .env("WAYSYNC_ENV", profile.environment.unwrap_or(""))
+            .env(
+                "WAYSYNC_DEVICE",
+                profile
+                    .device
+                    .map(|device| device.to_string())
+                    .unwrap_or_default(),
+            )
+            .current_dir(repo_dir)
             .status()
             .with_context(|| format!("Failed to run hook: {}", cmd_str))?;
         if !status.success() {
-            eprintln!("  Warning: hook exited with non-zero status: {}", cmd_str);
+            bail!("{label} hook exited with {status}: {cmd_str}");
         }
     }
     Ok(())

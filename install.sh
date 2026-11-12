@@ -51,7 +51,7 @@ info "Cloning waysync from ${WAYSYNC_REPO_URL} (branch:${WAYSYNC_BRANCH})..."
 git clone --depth 1 --branch "$WAYSYNC_BRANCH" "$WAYSYNC_REPO_URL" "$TMP_DIR/waysync"
 
 info "Building waysync (release profile)..."
-cargo build --release --manifest-path "$TMP_DIR/waysync/Cargo.toml"
+cargo build --release --locked --manifest-path "$TMP_DIR/waysync/Cargo.toml"
 
 info "Installing waysync to /usr/local/bin/waysync..."
 sudo install -Dm755 "$TMP_DIR/waysync/target/release/waysync" /usr/local/bin/waysync </dev/tty
