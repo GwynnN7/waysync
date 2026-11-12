@@ -83,10 +83,16 @@ fn retained_packages(
         .iter()
         .filter(|c| names.contains(c.name.as_str()))
     {
-        retained.extend(packages::package_names_for_specs(
-            &component.packages,
-            &config.repo_dir,
-        )?);
+        for name in packages::package_names_for_specs(&component.packages, &config.repo_dir)? {
+            if !name.contains(['<', '>', '=']) {
+                retained.insert(
+                    name.strip_suffix("-git")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{name}-git")),
+                );
+            }
+            retained.insert(name);
+        }
     }
     Ok(retained)
 }
@@ -123,8 +129,21 @@ fn install_component(component: &Component, config: &AppConfig, state: &mut Stat
     println!("\n  {} {}", style("[+]").green(), component.name);
     let newly_enabled = !state.is_installed(&component.name);
     if newly_enabled && !component.packages.is_empty() {
-        packages::ensure_paru()?;
-        packages::install_packages(&component.packages, &config.repo_dir, true)?;
+        let missing = packages::missing_specs(&component.packages, &config.repo_dir)?;
+        if !missing.is_empty() {
+            packages::ensure_paru()?;
+        }
+        let mut failures = Vec::new();
+        for spec in missing {
+            if let Err(error) =
+                packages::install_packages(std::slice::from_ref(&spec), &config.repo_dir, true)
+            {
+                failures.push(format!("{spec}: {error:#}"));
+            }
+        }
+        if !failures.is_empty() {
+            bail!("Package installation incomplete: {}", failures.join("; "));
+        }
     }
     if newly_enabled {
         state.pending_install.insert(component.name.clone());
@@ -200,7 +219,13 @@ fn audit_installed_packages<'a>(
                 );
             }
             let names = &resolved[spec];
-            if names.iter().any(|name| !installed.contains(name)) {
+            let mut satisfied = true;
+            for name in names {
+                if !packages::requirement_satisfied(name, &installed)? {
+                    satisfied = false;
+                }
+            }
+            if !satisfied {
                 missing.push(spec.clone());
             }
         }
@@ -211,29 +236,53 @@ fn audit_installed_packages<'a>(
     Ok(repairs)
 }
 
+#[derive(Default)]
+struct RepairReport {
+    failed_components: HashSet<String>,
+    errors: Vec<String>,
+}
+
+fn finish_with_issues(errors: &[String]) -> Result<()> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    eprintln!("\nCompleted remaining work with {} issue(s):", errors.len());
+    for error in errors {
+        eprintln!("  - {error}");
+    }
+    bail!("Some component steps failed; successful work was saved and failed work can be retried with sync")
+}
+
 fn repair_missing_packages(
     config: &AppConfig,
     repairs: &[(&Component, Vec<String>)],
-) -> Result<()> {
-    let mut repaired = HashSet::new();
+) -> RepairReport {
+    let mut attempted: HashMap<String, bool> = HashMap::new();
+    let mut report = RepairReport::default();
     for (component, specs) in repairs {
-        let specs: Vec<_> = specs
-            .iter()
-            .filter(|spec| repaired.insert((*spec).clone()))
-            .cloned()
-            .collect();
-        if specs.is_empty() {
-            continue;
+        for spec in specs {
+            let failed = if let Some(failed) = attempted.get(spec) {
+                *failed
+            } else {
+                println!("  Restoring missing package for {}: {spec}", component.name);
+                let result = packages::ensure_paru().and_then(|_| {
+                    packages::install_packages(std::slice::from_ref(spec), &config.repo_dir, true)
+                });
+                let failed = result.is_err();
+                if let Err(error) = result {
+                    let message = format!("{} ({spec}): {error:#}", component.name);
+                    eprintln!("  Skipping failed repair: {message}");
+                    report.errors.push(message);
+                }
+                attempted.insert(spec.clone(), failed);
+                failed
+            };
+            if failed {
+                report.failed_components.insert(component.name.clone());
+            }
         }
-        println!(
-            "  Restoring missing packages for {}: {}",
-            component.name,
-            specs.join(", ")
-        );
-        packages::ensure_paru()?;
-        packages::install_packages(&specs, &config.repo_dir, true)?;
     }
-    Ok(())
+    report
 }
 
 pub fn apply_changes(
@@ -313,7 +362,7 @@ pub fn apply_changes(
             || selected.iter().any(|c| apply_requires_sudo(c, state))
             || removals.iter().any(|c| requires_sudo(c)),
     )?;
-    repair_missing_packages(config, &repairs)?;
+    let mut report = repair_missing_packages(config, &repairs);
     if !selection.disabled.is_empty() {
         for name in &selection.disabled {
             state.components.insert(name.clone(), false);
@@ -324,10 +373,21 @@ pub fn apply_changes(
     }
     for component in selected {
         state.components.insert(component.name.clone(), true);
+        if report.failed_components.contains(&component.name) {
+            state.save(&config.state_file)?;
+            println!(
+                "  Deferring files/hooks for {} until its missing packages are restored.",
+                component.name
+            );
+            continue;
+        }
         let result = install_component(component, config, state);
-        checkpoint(config, state, result)?;
+        state.save(&config.state_file)?;
+        if let Err(error) = result {
+            report.errors.push(format!("{}: {error:#}", component.name));
+        }
     }
-    Ok(())
+    finish_with_issues(&report.errors)
 }
 
 /// Deploy only enabled, installed components. Never install/remove packages or run post_install.
@@ -411,11 +471,17 @@ pub fn reinstall_packages(
         .filter(|c| !c.packages.is_empty())
         .collect();
     let _sudo = sudo_session(!components.is_empty())?;
+    let mut errors = Vec::new();
     for component in components {
-        packages::ensure_paru()?;
-        packages::install_packages(&component.packages, &config.repo_dir, false)?;
+        for spec in &component.packages {
+            if let Err(error) = packages::ensure_paru().and_then(|_| {
+                packages::install_packages(std::slice::from_ref(spec), &config.repo_dir, false)
+            }) {
+                errors.push(format!("{} ({spec}): {error:#}", component.name));
+            }
+        }
     }
-    Ok(())
+    finish_with_issues(&errors)
 }
 
 fn deployment_requires_sudo(component: &Component, profile: Profile<'_>, run_hooks: bool) -> bool {
@@ -619,10 +685,13 @@ pub fn change_profile(
         }
     }
     state.save(&config.state_file)?;
-    repair_missing_packages(config, &repairs)?;
+    let mut report = repair_missing_packages(config, &repairs);
     let result = remove_components(&removals, config, state, &retained);
     checkpoint(config, state, result)?;
     for (component, newly_active) in updates {
+        if report.failed_components.contains(&component.name) {
+            continue;
+        }
         let result = if newly_active {
             install_component(component, config, state)
         } else {
@@ -631,8 +700,12 @@ pub fn change_profile(
                 hooks::run_hooks(&component.post_deploy, "post_deploy", new, &config.repo_dir)
             })()
         };
-        checkpoint(config, state, result)?;
+        state.save(&config.state_file)?;
+        if let Err(error) = result {
+            report.errors.push(format!("{}: {error:#}", component.name));
+        }
     }
+    finish_with_issues(&report.errors)?;
     Ok(true)
 }
 

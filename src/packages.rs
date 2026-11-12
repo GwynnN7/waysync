@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -389,7 +390,13 @@ fn local_package_needs_build(pkg_dir: &Path, name: &str) -> Result<bool> {
 
 /// Ask user how to proceed if an interactive package installation still fails.
 fn prompt_package_failure(label: &str) -> Result<bool> {
-    let choices = &["Abort deployment", "Retry interactive installation"];
+    if !std::io::stdin().is_terminal() {
+        bail!("Package step failed for '{label}'; continuing with other components");
+    }
+    let choices = &[
+        "Skip failed step and continue other components",
+        "Retry interactive installation",
+    ];
     let selection = Select::new()
         .with_prompt(format!(
             "Package step failed for '{}'. How to proceed?",
@@ -401,10 +408,7 @@ fn prompt_package_failure(label: &str) -> Result<bool> {
 
     match selection {
         1 => Ok(true), // Retry
-        _ => bail!(
-            "Deployment aborted by user after package failure: {}",
-            label
-        ),
+        _ => bail!("Package step skipped after failure: {}", label),
     }
 }
 
@@ -412,7 +416,9 @@ fn prompt_package_failure(label: &str) -> Result<bool> {
 /// 1. Attempts automatic execution with `--noconfirm` (`auto_args`).
 /// 2. If that fails (e.g. conflict or provider prompt), automatically drops into
 ///    interactive mode (`interactive_args`, without `--noconfirm`).
-/// 3. If interactive mode also fails, prompts the user to Retry or Abort.
+/// 3. If interactive mode also fails, default to skipping the failed step.
+///
+/// Errors are returned so the engine can continue without recording false success.
 fn run_with_interactive_fallback(
     label: &str,
     program: &str,
@@ -433,6 +439,9 @@ fn run_with_interactive_fallback(
         return Ok(());
     }
 
+    if !std::io::stdin().is_terminal() {
+        bail!("Package step failed for '{label}' (no interactive terminal)");
+    }
     println!(
         "  {} Automatic install failed for '{}'. Retrying interactively...",
         style("!").yellow().bold(),
@@ -813,4 +822,57 @@ pub fn names_for_package_audit(spec: &str, repo_path: &Path) -> Result<Vec<Strin
             Ok(names)
         }
     }
+}
+
+/// Accept installed stable/Git counterparts as requested by this personal setup,
+/// then let libalpm handle declared Provides and versioned requirements.
+pub fn requirement_satisfied(
+    name: &str,
+    installed: &std::collections::HashSet<String>,
+) -> Result<bool> {
+    if installed.contains(name) {
+        return Ok(true);
+    }
+    let versioned = name.contains(['<', '>', '=']);
+    if !versioned {
+        let alternate = name
+            .strip_suffix("-git")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{name}-git"));
+        if installed.contains(&alternate) {
+            return Ok(true);
+        }
+    }
+    let output = Command::new("pacman")
+        .args(["-T", name])
+        .output()
+        .context("Failed to check installed package providers")?;
+    match output.status.code() {
+        Some(0) if output.stdout.is_empty() => Ok(true),
+        Some(127) => Ok(false),
+        _ => bail!(
+            "Could not check providers for {name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+pub fn missing_specs(specs: &[String], repo: &Path) -> Result<Vec<String>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let installed = installed_package_names()?;
+    let mut missing = Vec::new();
+    for spec in specs {
+        let mut satisfied = true;
+        for name in names_for_package_audit(spec, repo)? {
+            if !requirement_satisfied(&name, &installed)? {
+                satisfied = false;
+            }
+        }
+        if !satisfied {
+            missing.push(spec.clone());
+        }
+    }
+    Ok(missing)
 }

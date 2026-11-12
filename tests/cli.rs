@@ -269,6 +269,7 @@ fn sync_restores_manually_removed_native_aur_and_split_packages_but_deploy_does_
 printf 'pacman %s\n' "$*" >> '{}'
 if [ -f '{}' ]; then printf 'database query failed\n' >&2; exit 1; fi
 case "$*" in
+  '-T '*) printf '%s\n' "$2"; exit 127;;
   '-Qq') /bin/cat '{}';;
   '-Qq '*) while IFS= read -r name; do [ "$name" = "$2" ] && exit 0; done < '{}'; exit 1;;
   '-Q '*) printf '%s 0-1\n' "$2";;
@@ -609,4 +610,182 @@ fn check_validates_unknown_fields_inside_manifest_fragments() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("components/test.toml") && stdout.contains("defualt"));
     assert!(!root.path().join("state").exists());
+}
+
+#[test]
+fn providers_and_stable_git_variants_are_accepted_and_failed_packages_do_not_block_other_modules() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("data/waysync/repo");
+    let tools = root.path().join("tools");
+    let log = root.path().join("calls");
+    fs::create_dir_all(repo.join("dotfiles")).unwrap();
+    fs::create_dir_all(&tools).unwrap();
+    fs::create_dir_all(root.path().join("state/waysync")).unwrap();
+    std::os::unix::fs::symlink("/bin/sh", tools.join("sh")).unwrap();
+    for (name, body) in [
+        ("pacman", "if [ \"$1\" = -Qq ]; then printf 'astra-atlas\\npapirus-folders-git\\ncustom-provider\\n'; exit 0; fi\nif [ \"$1\" = -T ]; then [ \"$2\" = provider-alias ] && exit 0; printf '%s\\n' \"$2\"; exit 127; fi\nexit 1\n"),
+        ("paru", "[ \"$1\" = --version ] && exit 0\ncase \"$*\" in *broken-package*) exit 1;; esac\nexit 0\n"),
+        ("sudo", "exit 0\n"),
+    ] {
+        let path = tools.join(name);
+        fs::write(&path, format!("#!/bin/sh\nprintf '{name} %s\\n' \"$*\" >> '{}'\n{body}", log.display())).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(
+        repo.join("manifest.toml"),
+        r#"
+        [[components]]
+        name='variants'
+        packages=['astra-atlas-git','papirus-folders','provider-alias']
+        [[components]]
+        name='broken'
+        packages=['broken-package']
+        post_deploy=['printf bad >> hooks']
+        [[components.files]]
+        src='config'
+        dest='$XDG_CONFIG_HOME/broken'
+        [[components]]
+        name='good'
+        packages=['good-package']
+        [[components.files]]
+        src='config'
+        dest='$XDG_CONFIG_HOME/good'
+        [[components]]
+        name='healthy'
+        [[components.files]]
+        src='config'
+        dest='$XDG_CONFIG_HOME/healthy'
+        [[components]]
+        name='fresh'
+        packages=['broken-package','good-package']
+        post_install=['printf bad >> hooks']
+        [[components.files]]
+        src='config'
+        dest='$XDG_CONFIG_HOME/fresh'
+    "#,
+    )
+    .unwrap();
+    fs::write(repo.join("dotfiles/config"), "working").unwrap();
+    let state_path = root.path().join("state/waysync/state.toml");
+    fs::write(&state_path, "installed=['variants','broken','good','healthy']\n[components]\nvariants=true\nbroken=true\ngood=true\nhealthy=true\n").unwrap();
+    let invoke = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_waysync"))
+            .args(args)
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("PATH", &tools)
+            .output()
+            .unwrap()
+    };
+    let output = invoke(&["sync"]);
+    assert!(
+        !output.status.success(),
+        "Failures must still be reported at the end"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Completed remaining work"));
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(
+        !calls.contains("--noconfirm astra-atlas-git")
+            && !calls.contains("--noconfirm papirus-folders")
+            && !calls.contains("--noconfirm provider-alias")
+    );
+    assert!(calls.contains("--noconfirm good-package"));
+    for name in ["good", "healthy"] {
+        assert_eq!(
+            fs::read_to_string(root.path().join("config").join(name)).unwrap(),
+            "working"
+        );
+    }
+    assert!(!root.path().join("config/broken").exists());
+    assert!(!repo.join("hooks").exists());
+
+    let mut state: toml::Value = fs::read_to_string(&state_path).unwrap().parse().unwrap();
+    state["installed"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|v| v.as_str() != Some("variants"));
+    fs::write(&state_path, toml::to_string(&state).unwrap()).unwrap();
+    fs::write(&log, "").unwrap();
+    assert!(invoke(&["install", "variants"]).status.success());
+    assert!(
+        !fs::read_to_string(&log).unwrap().contains("paru"),
+        "First installation must also respect existing variants/providers"
+    );
+
+    fs::write(repo.join("dotfiles/config"), "updated healthy config").unwrap();
+    fs::write(&log, "").unwrap();
+    assert!(!invoke(&["install", "fresh", "healthy"]).status.success());
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains("--noconfirm broken-package") && calls.contains("--noconfirm good-package")
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("config/healthy")).unwrap(),
+        "updated healthy config"
+    );
+    assert!(!root.path().join("config/fresh").exists());
+    let state: toml::Value = fs::read_to_string(state_path).unwrap().parse().unwrap();
+    assert_eq!(state["components"]["fresh"].as_bool(), Some(true));
+    assert!(!state["installed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some("fresh")));
+    assert!(!repo.join("hooks").exists());
+}
+
+#[test]
+fn capture_uses_sudo_read_without_unprivileged_stat_of_protected_parent() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("data/waysync/repo");
+    let author = root.path().join("author");
+    let tools = root.path().join("tools");
+    let protected = root.path().join("protected");
+    for dir in [&repo, &author] {
+        fs::create_dir_all(dir.join("dotfiles")).unwrap();
+    }
+    fs::create_dir_all(&tools).unwrap();
+    fs::create_dir_all(&protected).unwrap();
+    fs::create_dir_all(root.path().join("state/waysync")).unwrap();
+    let dest = protected.join("secret");
+    fs::write(&dest, "deployed edit").unwrap();
+    let manifest = format!("[[components]]\nname='secret'\nask=true\n[[components.files]]\nsrc='secret'\ndest='{}'\nsudo=true\n", dest.display());
+    for dir in [&repo, &author] {
+        fs::write(dir.join("manifest.toml"), &manifest).unwrap();
+        fs::write(dir.join("dotfiles/secret"), "original").unwrap();
+    }
+    git(&author, &["init", "-b", "main"]);
+    std::os::unix::fs::symlink("/usr/bin/git", tools.join("git")).unwrap();
+    let sudo = tools.join("sudo");
+    fs::write(
+        &sudo,
+        "#!/bin/sh\n[ \"$1\" = cat ] || exit 1\nprintf 'deployed edit'\n",
+    )
+    .unwrap();
+    fs::set_permissions(sudo, fs::Permissions::from_mode(0o755)).unwrap();
+    let baseline = hex::encode(Sha256::digest(b"original"));
+    fs::write(root.path().join("state/waysync/state.toml"), format!("installed=['secret']\n[components]\nsecret=true\n[hashes]\n'{}'='{}'\n[deployed]\nsecret=['{}']\n[sources]\n'{}'='dotfiles/secret'\n", dest.display(), baseline, dest.display(), dest.display())).unwrap();
+    fs::set_permissions(&protected, fs::Permissions::from_mode(0o000)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_waysync"))
+        .args(["capture", "--repo", author.to_str().unwrap(), "--yes"])
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("PATH", &tools)
+        .output()
+        .unwrap();
+    fs::set_permissions(&protected, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(author.join("dotfiles/secret")).unwrap(),
+        "deployed edit"
+    );
 }

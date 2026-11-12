@@ -124,7 +124,7 @@ The TUI has **Capture Local Changes** with an authoring-checkout prompt. Capture
 
 Capture compares the deployed contents and authoring contents against the last deployment hash. It skips unchanged deployed files and edits already present in the checkout. If both versions changed, interactive mode asks before replacing the checkout file; `--yes` skips such conflicts. Use `--yes --force` only when you explicitly want the deployed edit to replace conflicting checkout edits. Skipped paths produce a nonzero exit status with diagnostics; successfully copied files remain copied.
 
-The authoring directory must be a Git checkout root with a compatible manifest and source layout. Existing source permissions are preserved. Source symlinks, ambiguous routes, and files changed during review are refused. Missing deployed files are reported, not treated as deletions. Untracked/generated files and external `repo:` checkouts are excluded. Capture copies file contents; it does not import deployed permission changes.
+The authoring directory must be a Git checkout root with a compatible manifest and source layout. Existing source permissions are preserved. Protected deployed files marked `sudo = true` are read with sudo, including paths whose parent directories cannot be inspected without privileges. Source symlinks, ambiguous routes, and files changed during review are refused. Missing deployed files are reported, not treated as deletions. Untracked/generated files and external `repo:` checkouts are excluded. Capture copies file contents; it does not import deployed permission changes.
 
 Nothing is staged, committed, or pushed, and no hooks or package managers run. Capture does not alter deployment hashes or the managed checkout when writing to a separate authoring checkout. Review and push normally, then refresh the managed checkout before applying again:
 
@@ -161,6 +161,10 @@ References: [PKGBUILD dependency fields](https://man.archlinux.org/man/PKGBUILD.
 ## Missing package reconciliation
 
 `sync`, **Manage → Apply Selection**, explicit component installation, and profile changes audit packages for the installed components they reconcile. Waysync reads pacman's installed package list and resolves `local:` recipes in temporary directories so split-package outputs are checked by their actual names. A missing output rebuilds/reinstalls that recipe. Already present package specs are left alone; package database query errors stop the operation rather than triggering a mass reinstall.
+
+Installed providers satisfy requirements through pacman's dependency checks. For this personal setup, unversioned stable/Git counterparts are also accepted in either direction (for example `astra-atlas` / `astra-atlas-git` and `papirus-folders` / `papirus-folders-git`). Sync and first installation preserve the installed choice rather than trying to replace it. Explicit version requirements still use pacman's dependency test; a name ending in `-git` is otherwise a preference, not a demand to replace a working stable installation. Explicit **Reinstall Packages** continues to target the manifest's chosen specs.
+
+A failed package build/install is reported and skipped so the remaining packages/components can run. Interactive failure choices default to Skip, with Retry available. Noninteractive failures are recorded without waiting for input. A failed component is not recorded as successfully installed; its selection remains enabled for a later sync retry. For an already managed component with a failed missing-package repair, its files and hooks are deferred until the repair succeeds. The final summary lists failures and exits nonzero after remaining work has completed. Package database/query errors and invalid configuration still stop before making unsafe assumptions.
 
 Restoration does not rerun `post_install` for an already managed component. Its normal deployment phase still runs `post_deploy`, unless that optional file update is skipped. `ask = true` controls file-update approval and capture eligibility; it does not exempt saved packages from restoration. Without a terminal, optional file updates are skipped while required package restoration still runs.
 
@@ -267,7 +271,7 @@ Legacy `environment = "name"`, `shell = "name"`, and `[shells]` remain accepted.
 - `post_deploy` runs after every deployment of that component.
 - Retained components on a profile switch run only applicable `post_deploy` hooks. Use these for environment/device activation work; `post_install` is reserved for installing or reactivating a component. Reinstall Packages does not invoke either hook phase.
 - Hooks run through `sh -c` from the repository root, with `WAYSYNC_REPO_DIR`, `WAYSYNC_ENV`, and `WAYSYNC_DEVICE` set. Unset axes are empty strings.
-- A failed hook stops the operation and reports the failure. For deliberately optional commands, handle the expected failure explicitly, for example `hyprctl reload || true` when running outside a session.
+- A failed hook stops that component and reports the failure. Component reconciliation continues with other components and summarizes errors afterward. For deliberately optional commands, handle the expected failure explicitly, for example `hyprctl reload || true` when running outside a session.
 - `src = "repo:owner/project"` clones a GitHub repository into `dest` or pulls an existing checkout. It bypasses override layers, does not support `sudo`, and the checkout is preserved on uninstall to protect user work.
 
 In TOML, keys after `[[components.files]]` belong to that file table until another table starts. Put component hooks before the first file table. `check` reports ignored keys and misplaced hooks and exits nonzero for any finding.

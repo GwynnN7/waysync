@@ -136,7 +136,9 @@ fn plan_capture(
                 let Some(baseline) = state.hashes.get(key) else {
                     bail!("No deployment baseline; redeploy/review this file before capturing it");
                 };
-                if !deployed.try_exists()? {
+                // stat itself can fail on protected parent directories before sudo
+                // gets a chance to read the file. Privileged entries go straight to sudo cat.
+                if !current.entry.sudo && !deployed.try_exists()? {
                     bail!("Deployed file is missing; capture never propagates deletions");
                 }
                 let local = read_file_contents(deployed, current.entry.sudo)?;
