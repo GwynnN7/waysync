@@ -65,6 +65,7 @@ pub fn unknown_fields(content: &str) -> Result<Vec<String>> {
                     "files",
                     "post_install",
                     "post_deploy",
+                    "post_reinstall",
                 ],
                 &location,
                 &mut warnings,
@@ -88,7 +89,7 @@ pub fn unknown_fields(content: &str) -> Result<Vec<String>> {
                     );
                 }
             }
-            for hook_type in ["post_install", "post_deploy"] {
+            for hook_type in ["post_install", "post_deploy", "post_reinstall"] {
                 if let Some(hooks) = component.get(hook_type).and_then(|v| v.as_array()) {
                     for hook in hooks {
                         inspect(

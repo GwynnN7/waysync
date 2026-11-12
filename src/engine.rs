@@ -459,7 +459,7 @@ fn installed_targets<'a>(
         .collect())
 }
 
-/// Force package reinstall/rebuild only. Component files, hooks, and selections are untouched.
+/// Force package reinstall/rebuild and run reload hooks; files and selections are untouched.
 pub fn reinstall_packages(
     config: &AppConfig,
     manifest: &Manifest,
@@ -473,11 +473,26 @@ pub fn reinstall_packages(
     let _sudo = sudo_session(!components.is_empty())?;
     let mut errors = Vec::new();
     for component in components {
+        let failures_before = errors.len();
         for spec in &component.packages {
             if let Err(error) = packages::ensure_paru().and_then(|_| {
                 packages::install_packages(std::slice::from_ref(spec), &config.repo_dir, false)
             }) {
                 errors.push(format!("{} ({spec}): {error:#}", component.name));
+            }
+        }
+        if errors.len() == failures_before {
+            let reload = if !component.post_reinstall.is_empty() {
+                &component.post_reinstall
+            } else if component.category.as_deref() == Some("shell") {
+                &component.post_deploy
+            } else {
+                continue;
+            };
+            if let Err(error) =
+                hooks::run_hooks(reload, "post_reinstall", state.profile(), &config.repo_dir)
+            {
+                errors.push(format!("{} reload: {error:#}", component.name));
             }
         }
     }
@@ -514,6 +529,72 @@ fn apply_requires_sudo(component: &Component, state: &State) -> bool {
                 .iter()
                 .filter(|h| h.applies_to(state.profile()))
                 .any(|h| hook_requires_sudo(h.cmd())))
+}
+
+/// Shared full-sync entry point for CLI Sync and Manage → Apply.
+pub fn full_sync(
+    config: &AppConfig,
+    manifest: &Manifest,
+    state: &mut State,
+    selection: Option<&ComponentSelection>,
+) -> Result<()> {
+    let active: HashSet<_> = match selection {
+        Some(selection) => selection.enabled.iter().map(String::as_str).collect(),
+        None => manifest
+            .components_for_profile(state.profile())
+            .into_iter()
+            .filter(|c| state.is_enabled(&c.name))
+            .map(|c| c.name.as_str())
+            .collect(),
+    };
+    for name in &active {
+        let component = manifest
+            .find_component(name)
+            .with_context(|| format!("Unknown component: {name}"))?;
+        if !component.applies_to(state.profile()) {
+            bail!("Component '{name}' is inactive");
+        }
+    }
+    deploy::preflight(manifest, config, state.profile(), &active)?;
+    if manifest
+        .components
+        .iter()
+        .any(|c| active.contains(c.name.as_str()) && !c.packages.is_empty())
+    {
+        packages::installed_package_names()?;
+    }
+    let mut local_specs: Vec<_> = manifest
+        .components
+        .iter()
+        .filter(|c| active.contains(c.name.as_str()))
+        .flat_map(|c| c.packages.iter())
+        .filter(|spec| spec.starts_with("local:"))
+        .cloned()
+        .collect();
+    local_specs.sort();
+    local_specs.dedup();
+    // Custom recipes must not accidentally be upgraded from an AUR recipe of the same name.
+    let mut ignored = Vec::new();
+    for spec in &local_specs {
+        ignored.extend(packages::names_for_package_audit(spec, &config.repo_dir)?);
+    }
+    ignored.sort();
+    ignored.dedup();
+    let _sudo = sudo_session(true)?;
+    let mut errors = packages::upgrade_system(&ignored)?;
+    for spec in local_specs {
+        if let Err(error) = packages::update_local_package(&spec, &config.repo_dir) {
+            errors.push(format!("{spec}: {error:#}"));
+        }
+    }
+    let result = match selection {
+        Some(selection) => apply_changes(config, manifest, state, selection),
+        None => sync_enabled(config, manifest, state),
+    };
+    if let Err(error) = result {
+        errors.push(format!("Components: {error:#}"));
+    }
+    finish_with_issues(&errors)
 }
 
 pub fn sync_enabled(config: &AppConfig, manifest: &Manifest, state: &mut State) -> Result<()> {

@@ -3,7 +3,25 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 fn run(root: &Path, arguments: &[&str]) -> Output {
+    // Full sync always upgrades the system. Never invoke host package tools in tests.
+    let tools = tempfile::tempdir().unwrap();
+    if arguments.first() == Some(&"sync") {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["paru", "sudo"] {
+            let path = tools.path().join(name);
+            fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
     Command::new(env!("CARGO_BIN_EXE_waysync"))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                tools.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .args(arguments)
         .env("XDG_STATE_HOME", root.join("state"))
         .env("XDG_DATA_HOME", root.join("data"))
@@ -148,7 +166,7 @@ fn package_deployment_and_hook_scopes_are_independent() {
     std::os::unix::fs::symlink("/bin/sh", tools.join("sh")).unwrap();
     for name in ["paru", "sudo", "makepkg", "pacman"] {
         let path = tools.join(name);
-        fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{name} ' \"$*\" >> '{}'\nif [ '{name}' = makepkg ]; then printf 'pkgname = local-example\\npkgver = 1\\npkgrel = 1\\n'; fi\nif [ '{name}' = pacman ]; then printf 'native-example\\naur-example\\nlocal-example\\n'; fi\nexit 0\n", calls.display())).unwrap();
+        fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{name} ' \"$*\" >> '{}'\nif [ '{name}' = makepkg ]; then printf 'pkgname = local-example\\npkgver = 1\\npkgrel = 1\\n'; fi\nif [ '{name}' = pacman ]; then if [ \"$1\" = -Q ]; then printf '%s 1-1\\n' \"$2\"; else printf 'native-example\\naur-example\\nlocal-example\\n'; fi; fi\nexit 0\n", calls.display())).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     fs::write(
@@ -199,8 +217,11 @@ fn package_deployment_and_hook_scopes_are_independent() {
     let audit = fs::read_to_string(&calls).unwrap();
     assert!(audit.contains("pacman"));
     assert!(
-        !audit.contains("paru") && !audit.contains("sudo"),
-        "Installed packages must only be audited, not reinstalled"
+        audit.contains("-Syu --repo --ignore local-example")
+            && audit.contains("-Su --aur --devel --ignore local-example")
+            && !audit.contains("-Ui")
+            && !audit.contains("--rebuild"),
+        "Full sync upgrades globally but skips unchanged local recipes: {audit}"
     );
     fs::write(&calls, "").unwrap();
     assert_eq!(
@@ -272,7 +293,7 @@ case "$*" in
   '-T '*) printf '%s\n' "$2"; exit 127;;
   '-Qq') /bin/cat '{}';;
   '-Qq '*) while IFS= read -r name; do [ "$name" = "$2" ] && exit 0; done < '{}'; exit 1;;
-  '-Q '*) printf '%s 0-1\n' "$2";;
+  '-Q '*) printf '%s 1-1\n' "$2";;
 esac
 "#,
                 calls.display(),
@@ -286,10 +307,14 @@ esac
             format!(
                 r#"#!/bin/sh
 printf 'paru %s\n' "$*" >> '{}'
-[ "$1" = --version ] && exit 0
-printf 'native-example\naur-example\nsplit-a\nsplit-b\n' > '{}'
+case "$1" in
+  --version|-Syu|-Su) exit 0;;
+  -Ui) printf 'split-a\nsplit-b\n' >> '{}';;
+  -S) for target in "$@"; do case "$target" in native-example|aur-example) printf '%s\n' "$target" >> '{}';; esac; done;;
+esac
 "#,
                 calls.display(),
+                database.display(),
                 database.display()
             ),
         ),
@@ -356,10 +381,13 @@ printf 'pkgname = split-a\npkgname = split-b\npkgver = 1\npkgrel = 1\n'
         "A missing split output must rebuild its local recipe: {log}"
     );
     assert!(
-        !log.contains("--aur"),
+        !log.contains("-S --aur --needed"),
         "The installed AUR package should not be reinstalled"
     );
-    assert_eq!(fs::read_to_string(&database).unwrap(), complete);
+    let installed = fs::read_to_string(&database).unwrap();
+    for package in complete.lines() {
+        assert!(installed.lines().any(|name| name == package));
+    }
     assert_eq!(
         fs::read(repo.join("hooks")).unwrap(),
         hook_baseline,
@@ -402,10 +430,10 @@ printf 'pkgname = split-a\npkgname = split-b\npkgver = 1\npkgrel = 1\n'
     success(&["uninstall", "config"]);
     fs::write(&calls, "").unwrap();
     success(&["sync"]);
-    assert_eq!(
-        fs::read_to_string(&calls).unwrap(),
-        "",
-        "A component removed through Waysync must stay removed"
+    let log = fs::read_to_string(&calls).unwrap();
+    assert!(
+        log.contains("-Syu --repo") && !log.contains("--noconfirm"),
+        "A component removed through Waysync must stay removed: {log}"
     );
     assert!(!root.path().join("config/test/settings").exists());
 }
@@ -861,4 +889,245 @@ exec "/usr/bin/$cmd" "$@"
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("test allocation denied"));
     assert_ne!(fs::read_to_string(dest).unwrap(), "updated script");
+}
+
+#[test]
+fn full_sync_checks_upstream_locals_and_continues_after_aur_or_source_failures() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("data/waysync/repo");
+    let tools = root.path().join("tools");
+    let calls = root.path().join("calls");
+    fs::create_dir_all(&tools).unwrap();
+    fs::create_dir_all(repo.join("dotfiles")).unwrap();
+    fs::create_dir_all(root.path().join("state/waysync")).unwrap();
+    std::os::unix::fs::symlink("/bin/sh", tools.join("sh")).unwrap();
+    for name in ["changed", "unchanged", "disabled", "variant"] {
+        let recipe = repo.join("packages").join(name);
+        fs::create_dir_all(&recipe).unwrap();
+        fs::write(recipe.join("kind"), name).unwrap();
+        fs::write(recipe.join("PKGBUILD"), "pkgver=1\npkgver() { echo 1; }\n").unwrap();
+    }
+    let scripts = [
+        ("sudo", "exit 0\n".to_string()),
+        (
+            "paru",
+            format!(
+                r#"
+[ "$1" = --version ] && exit 0
+if [ "$1" = -Ui ]; then printf 'build %s\n' "$(/bin/cat kind)" >> '{0}'; fi
+printf 'paru %s\n' "$*" >> '{0}'
+[ "$1" = -Syu ] && [ -f '{1}/fail-repo' ] && exit 1
+[ "$1" = -Su ] && [ -f '{1}/fail-aur' ] && exit 1
+exit 0
+"#,
+                calls.display(),
+                root.path().display()
+            ),
+        ),
+        (
+            "pacman",
+            r#"
+case "$1" in
+ -Qq) if [ -z "$2" ]; then printf 'changed\nunchanged\nvariant\n'; fi;;
+ -Q) printf '%s 1-1\n' "$2";;
+esac
+"#
+            .to_string(),
+        ),
+        (
+            "vercmp",
+            "if [ \"$1\" = \"$2\" ]; then echo 0; else echo -1; fi\n".to_string(),
+        ),
+        (
+            "makepkg",
+            format!(
+                r#"
+kind=$(/bin/cat kind)
+if [ "$1" = -od ]; then
+ printf 'refresh %s\n' "$kind" >> '{0}'
+ [ "$kind" = changed ] && [ -f '{1}/fail-refresh' ] && exit 1
+ printf yes > refreshed
+ exit 0
+fi
+version=1
+[ "$kind" = changed ] && [ -f refreshed ] && version=2
+[ "$kind" = variant ] && kind=variant-git
+printf 'pkgname = %s\npkgver = %s\npkgrel = 1\n' "$kind" "$version"
+"#,
+                calls.display(),
+                root.path().display()
+            ),
+        ),
+    ];
+    for (name, body) in scripts {
+        let file = tools.join(name);
+        fs::write(&file, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(
+        repo.join("manifest.toml"),
+        r#"
+[[components]]
+name='locals'
+packages=['local:changed','local:unchanged','local:variant']
+[[components.files]]
+src='config'
+dest='$XDG_CONFIG_HOME/test'
+[[components]]
+name='disabled'
+packages=['local:disabled']
+"#,
+    )
+    .unwrap();
+    fs::write(repo.join("dotfiles/config"), "initial").unwrap();
+    fs::write(
+        root.path().join("state/waysync/state.toml"),
+        "installed=['locals']\n[components]\nlocals=true\ndisabled=false\n",
+    )
+    .unwrap();
+    let invoke = || {
+        Command::new(env!("CARGO_BIN_EXE_waysync"))
+            .arg("sync")
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("PATH", &tools)
+            .output()
+            .unwrap()
+    };
+    let output = invoke();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = fs::read_to_string(&calls).unwrap();
+    assert!(log.contains("-Syu --repo --ignore changed,unchanged,variant-git"));
+    assert!(log.contains("-Su --aur --devel --ignore changed,unchanged,variant-git"));
+    assert!(log.find("-Syu").unwrap() < log.find("-Su").unwrap());
+    assert!(log.find("-Su").unwrap() < log.find("refresh changed").unwrap());
+    assert!(log.contains("build changed") && log.contains("refresh unchanged"));
+    assert!(
+        !log.contains("build unchanged")
+            && !log.contains("refresh variant")
+            && !log.contains("disabled")
+    );
+    assert!(
+        !repo.join("packages/changed/refreshed").exists(),
+        "Source checks must leave the checkout untouched"
+    );
+
+    fs::write(root.path().join("fail-aur"), "").unwrap();
+    fs::write(root.path().join("fail-refresh"), "").unwrap();
+    fs::write(repo.join("dotfiles/config"), "after failures").unwrap();
+    fs::write(&calls, "").unwrap();
+    let output = invoke();
+    assert!(!output.status.success());
+    let errors = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        errors.contains("AUR upgrade failed") && errors.contains("Source refresh failed"),
+        "{errors}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("config/test")).unwrap(),
+        "after failures"
+    );
+    let log = fs::read_to_string(&calls).unwrap();
+    assert!(log.contains("refresh unchanged") && !log.contains("build changed"));
+
+    fs::write(root.path().join("fail-repo"), "").unwrap();
+    fs::write(repo.join("dotfiles/config"), "must wait").unwrap();
+    fs::write(&calls, "").unwrap();
+    assert!(!invoke().status.success());
+    let log = fs::read_to_string(&calls).unwrap();
+    assert!(log.contains("-Syu") && !log.contains("-Su ") && !log.contains("refresh"));
+    assert_eq!(
+        fs::read_to_string(root.path().join("config/test")).unwrap(),
+        "after failures"
+    );
+}
+
+#[test]
+fn reinstall_restarts_shells_and_uses_explicit_hooks_only_after_package_success() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("data/waysync/repo");
+    let tools = root.path().join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(root.path().join("state/waysync")).unwrap();
+    std::os::unix::fs::symlink("/bin/sh", tools.join("sh")).unwrap();
+    for (name, body) in [
+        ("sudo", "exit 0".to_string()),
+        (
+            "paru",
+            format!(
+                "[ \"$1\" = --version ] && exit 0\n[ -f '{}' ] && exit 1\nexit 0",
+                root.path().join("fail-packages").display()
+            ),
+        ),
+    ] {
+        let file = tools.join(name);
+        fs::write(&file, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(
+        repo.join("manifest.toml"),
+        r#"
+[[components]]
+name='legacy-shell'
+category='shell'
+packages=['shell-package']
+post_install=['printf setup >> events']
+post_deploy=['printf legacy >> events']
+[[components]]
+name='explicit-shell'
+category='shell'
+packages=['shell-package']
+post_install=['printf setup >> events']
+post_deploy=['printf deploy >> events']
+post_reinstall=[{cmd='printf explicit >> events', devices=['desktop']}]
+[[components]]
+name='ordinary'
+packages=['other-package']
+post_deploy=['printf ordinary >> events']
+"#,
+    )
+    .unwrap();
+    fs::write(root.path().join("state/waysync/state.toml"), "installed=['legacy-shell','explicit-shell','ordinary']\nactive_device='desktop'\n[components]\nlegacy-shell=true\nexplicit-shell=true\nordinary=true\n").unwrap();
+    let invoke = || {
+        Command::new(env!("CARGO_BIN_EXE_waysync"))
+            .arg("reinstall")
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("PATH", &tools)
+            .output()
+            .unwrap()
+    };
+    let state_before = fs::read(root.path().join("state/waysync/state.toml")).unwrap();
+    let output = invoke();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("events")).unwrap(),
+        "legacyexplicit"
+    );
+    assert_eq!(
+        fs::read(root.path().join("state/waysync/state.toml")).unwrap(),
+        state_before
+    );
+    fs::write(root.path().join("fail-packages"), "").unwrap();
+    assert!(!invoke().status.success());
+    assert_eq!(
+        fs::read_to_string(repo.join("events")).unwrap(),
+        "legacyexplicit",
+        "Failed package steps must not restart the shell"
+    );
 }

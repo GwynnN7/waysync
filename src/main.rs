@@ -65,7 +65,7 @@ enum Commands {
         #[arg(long, requires = "yes")]
         force: bool,
     },
-    /// Force package reinstall/rebuild only; no files, hooks, or tracking changes
+    /// Force package reinstall/rebuild and run reload hooks; no file or tracking changes
     Reinstall { components: Vec<String> },
     /// Install selected components (packages, files, hooks, and tracking)
     Install {
@@ -77,7 +77,7 @@ enum Commands {
         #[arg(required = true)]
         components: Vec<String>,
     },
-    /// Reconcile enabled components and deploy their files, without pulling
+    /// Upgrade system/AUR/local packages, reconcile components, and deploy files
     Sync,
     /// Show active profile and component status
     Status,
@@ -201,7 +201,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Sync) => {
             let (manifest, mut state) = load(&config)?;
-            engine::sync_enabled(&config, &manifest, &mut state)
+            engine::full_sync(&config, &manifest, &mut state, None)
         }
         Some(Commands::Env { name }) => {
             let (manifest, mut state) = load(&config)?;
@@ -388,7 +388,11 @@ fn cmd_interactive(config: &AppConfig) -> Result<()> {
         ) {
             if let Some(selection) = selection {
                 menu::with_visible_output(&term, || {
-                    engine::apply_changes(config, &manifest, &mut state, &selection)
+                    if matches!(action, MainMenuAction::ManageComponents) {
+                        engine::full_sync(config, &manifest, &mut state, Some(&selection))
+                    } else {
+                        engine::apply_changes(config, &manifest, &mut state, &selection)
+                    }
                 })?;
             }
             continue;

@@ -50,13 +50,13 @@ Only use dotfiles repositories you trust: installing packages evaluates their bu
 | `waysync deploy` | Deploy dotfiles for installed, enabled components and run `post_deploy`. No packages. |
 | `waysync deploy --no-hooks` | Deploy dotfiles only; skip all hooks and package operations. |
 | `waysync deploy fish` | Deploy only the named installed component(s). |
-| `waysync sync` | Reconcile saved choices and actual package presence: restore missing packages, install new components, remove disabled ones, and deploy retained components. No pull or forced package refresh. |
+| `waysync sync` | Upgrade system/AUR packages, check enabled local recipes, reconcile saved choices, and deploy dotfiles. No Git pull. |
 | `waysync install fish` | Install packages and files, run setup hooks, and enable the component. |
 | `waysync uninstall fish` | Remove unshared packages and unchanged managed files, then disable the component. |
 | `waysync capture --repo ~/Projects/dotfiles --dry-run` | Preview deployed edits to capture into your authoring checkout. |
 | `waysync capture --repo ~/Projects/dotfiles` | Review and copy edits; remember the checkout for later captures. |
 | `waysync capture --yes` | Copy nonconflicting edits into the remembered checkout without prompts. |
-| `waysync reinstall fish` | Force package reinstall/builds only; omit names for all enabled, installed components. |
+| `waysync reinstall fish` | Force package reinstall/builds and run reload hooks; omit names for all enabled, installed components. |
 | `waysync update` | Pull with `--ff-only` and validate the manifest. No packages, files, or hooks. |
 | `waysync status` | Show profile, enabled components, and tracked file counts. |
 | `waysync check` | Check all components available to the active profile, including optional ones. |
@@ -78,7 +78,7 @@ The home menu shows the active environment/device and four groups:
 | Profile | Environment, Device |
 | Repository | Pull changes, Check |
 
-Status and Quit are on the home menu. `Esc` or Back returns one level; actions return to the same submenu and selection. Long component/category lists scroll to keep the selected row visible. Routine output is brief: capture shows `No changes.` or `Captured 3 files.`; diffs and errors appear when relevant.
+Status and Quit are on the home menu. A short hint beneath the list describes the selected command. `Esc` or Back returns one level; actions return to the same submenu and selection. Long component/category lists scroll to keep the selected row visible. Routine output is brief: capture shows `No changes.` or `Captured 3 files.`; diffs and errors appear when relevant.
 
 | View | Keys |
 | --- | --- |
@@ -87,11 +87,11 @@ Status and Quit are on the home menu. `Esc` or Back returns one level; actions r
 | Components | `Space` toggles one; `a` toggles all matches; `/` filters by name; `Enter` / `Esc` / `h` goes back. |
 | Status | `↑` / `↓` scrolls; `Enter` / `Esc` returns. |
 
-**Components → Manage** starts with remembered choices, or `default` for new components. Applying the selection is a system operation, not just a preference save. New selections install packages and files; unchecked installed components are uninstalled; retained selections restore any missing packages and deploy their files without forcing upgrades or rebuilds. The confirmation names the removals.
+**Components → Manage** starts with remembered choices, or `default` for new components. Applying the selection is a system operation, not just a preference save. New selections install packages and files; unchecked installed components are uninstalled; a full system/AUR upgrade and local recipe update check run before component changes. Retained selections restore missing packages and deploy their files. The confirmation names the removals.
 
 **Components → Install** offers components Waysync has not installed. **Components → Uninstall** offers tracked installed components. Both perform real system/file changes and update Waysync's tracking. Both change the system; neither is a bookkeeping-only action.
 
-**Components → Reinstall** is a separate action for installed components with packages. The old reinstall checkbox is gone: forcing package installation has no purpose in file deployment or uninstall. It does not deploy files, run hooks, or change component choices. **Dotfiles → Deploy** asks whether to run deployment hooks; answer No for file copying only.
+**Components → Reinstall** is a separate action for installed components with packages. The old reinstall checkbox is gone: forcing package installation has no purpose in file deployment or uninstall. It runs `post_reinstall` hooks after successful package installation; existing shell components fall back to their `post_deploy` restart hook. It does not deploy files or change component choices. **Dotfiles → Deploy** asks whether to run deployment hooks; answer No for file copying only.
 
 ### Action boundaries
 
@@ -101,16 +101,16 @@ Status and Quit are on the home menu. `Esc` or Back returns one level; actions r
 | --- | --- | --- | --- | --- |
 | Deploy dotfiles | None | Enabled, installed components | `post_deploy` only | Unchanged; file hashes/ownership updated |
 | Deploy with `--no-hooks` | None | Enabled, installed components | None | Unchanged; file hashes/ownership updated |
-| Manage → Apply Selection / `sync` | Install new components, restore missing packages, remove deselected ones | Selected components | `post_install` for new installs, then `post_deploy` | Updated to reflect applied selection |
+| Manage → Apply Selection / `sync` | Upgrade system/AUR and enabled local recipes; install new components, restore missing packages, remove deselected ones | Selected components | `post_install` for new installs, then `post_deploy` | Updated to reflect applied selection |
 | Install components | Install missing packages | Selected components | New-install setup, then deployment hooks | Enable and record installation |
 | Uninstall components | Remove packages unclaimed by retained components | Remove unchanged tracked files | None | Disable and clear installation tracking |
-| Reinstall | Force reinstall/rebuild | None | None | Unchanged |
+| Reinstall | Force reinstall/rebuild | None | `post_reinstall`; shell fallback described below | Unchanged |
 | Update repository | None | None | None | Unchanged; only the Git checkout changes |
 | Capture local changes | None | Copy deployed edits back into the authoring checkout | None | Remember checkout; deployment baselines and choices unchanged |
 
-With an unchanged selection, **Manage → Apply Selection** also audits package presence, restores missing packages, and retries incomplete setup and cleanup. Use **Deploy Dotfiles** when you want to skip package checks entirely. Updating the repository is always separate. Use `waysync update` followed by `waysync deploy` for the common “get the new configs, then apply them” workflow.
+**Manage → Apply Selection** and `waysync sync` share the same full-sync path, including system packages installed outside Waysync. Even with an unchanged selection, they upgrade packages, audit package presence, restore missing packages, and retry incomplete setup and cleanup. Use **Deploy Dotfiles** when you want to skip package checks entirely. Updating the repository is always separate. Use `waysync update` followed by `waysync deploy` for the common “get the new configs, then apply them” workflow.
 
-For native repository packages, reinstall uses `paru -S` without `--needed`. For AUR packages it also requests `--rebuild`; `local:` recipes use `paru -Ui --rebuild` in a fresh build directory. Plain package names can resolve to either native or AUR packages. Reinstall is a repair/rebuild operation, not a full system upgrade. Waysync does not refresh the system package databases or perform `-Syu` on your behalf. If packages were manually removed outside Waysync, sync automatically restores the missing specs. Use Uninstall Components / `waysync uninstall` to remove them from management so later syncs leave them removed.
+For native repository packages, reinstall uses `paru -S` without `--needed`. For AUR packages it also requests `--rebuild`; `local:` recipes use `paru -Ui --rebuild` in a fresh build directory. Plain package names can resolve to either native or AUR packages. Reinstall is a repair/rebuild operation, not a full system upgrade. Full sync runs `paru -Syu --repo`, then `paru -Su --aur --devel`, with normal package-manager prompts. An official repository upgrade failure stops package sync to avoid continuing after a failed system upgrade. AUR failures are reported at the end while local checks and component reconciliation continue. If packages were manually removed outside Waysync, sync automatically restores the missing specs. Use Uninstall Components / `waysync uninstall` to remove them from management so later syncs leave them removed.
 
 Operations run on the normal terminal so logs stay in scrollback. Errors remain visible and you can return to the menu.
 
@@ -169,7 +169,9 @@ References: [PKGBUILD dependency fields](https://man.archlinux.org/man/PKGBUILD.
 
 ## Missing package reconciliation
 
-`sync`, **Manage → Apply Selection**, explicit component installation, and profile changes audit packages for the installed components they reconcile. Waysync reads pacman's installed package list and resolves `local:` recipes in temporary directories so split-package outputs are checked by their actual names. A missing output rebuilds/reinstalls that recipe. Already present package specs are left alone; package database query errors stop the operation rather than triggering a mass reinstall.
+`sync`, **Manage → Apply Selection**, explicit component installation, and profile changes audit packages for the installed components they reconcile. Waysync reads pacman's installed package list and resolves `local:` recipes in temporary directories so split-package outputs are checked by their actual names. A missing output rebuilds/reinstalls that recipe. Targeted installation and profile changes leave already present packages alone; full sync also updates them. Package database query errors stop the operation rather than triggering a mass reinstall.
+
+Full sync checks each enabled `local:` recipe in an isolated temporary directory. For VCS recipes, `makepkg -od --noconfirm` fetches sources and refreshes `pkgver()` without compiling. Waysync compares the recipe’s full version with installed split-package versions and builds only when an output is missing or newer. Fixed-version recipes update when their checked-out version changes. Local package names are excluded from the global paru upgrade so AUR recipes cannot replace your custom recipes. Disabled components are not checked. A failed source refresh is reported and other recipes continue.
 
 Installed providers satisfy requirements through pacman's dependency checks. For this personal setup, unversioned stable/Git counterparts are also accepted in either direction (for example `astra-atlas` / `astra-atlas-git` and `papirus-folders` / `papirus-folders-git`). Sync and first installation preserve the installed choice rather than trying to replace it. Explicit version requirements still use pacman's dependency test; a name ending in `-git` is otherwise a preference, not a demand to replace a working stable installation. Explicit **Reinstall** continues to target the manifest's chosen specs.
 
@@ -278,7 +280,8 @@ Legacy `environment = "name"`, `shell = "name"`, and `[shells]` remain accepted.
 
 - `post_install` runs after files are deployed when a component is newly installed or reactivated. A failed installation hook is retried on the next sync.
 - `post_deploy` runs after every deployment of that component.
-- Retained components on a profile switch run only applicable `post_deploy` hooks. Use these for environment/device activation work; `post_install` is reserved for installing or reactivating a component. Reinstall does not invoke either hook phase.
+- `post_reinstall` runs after all packages for a component have been successfully reinstalled. It supports the same environment/device scopes as other hooks. If omitted or empty on a `category = "shell"` component, Waysync runs that component’s `post_deploy` hooks to restart the shell. An explicit `post_reinstall` replaces that fallback. Reinstall never reruns `post_install` or copies files.
+- Retained components on a profile switch run only applicable `post_deploy` hooks. Use these for environment/device activation work; `post_install` is reserved for installing or reactivating a component.
 - Hooks run through `sh -c` from the repository root, with `WAYSYNC_REPO_DIR`, `WAYSYNC_ENV`, and `WAYSYNC_DEVICE` set. Unset axes are empty strings.
 - A failed hook stops that component and reports the failure. Component reconciliation continues with other components and summarizes errors afterward. For deliberately optional commands, handle the expected failure explicitly, for example `hyprctl reload || true` when running outside a session.
 - Optional reloads should handle an inactive app explicitly, for example `killall -USR2 btop 2>/dev/null || true`.

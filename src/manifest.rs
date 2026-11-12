@@ -88,6 +88,8 @@ pub struct Component {
     pub post_install: Vec<HookEntry>,
     #[serde(default)]
     pub post_deploy: Vec<HookEntry>,
+    #[serde(default)]
+    pub post_reinstall: Vec<HookEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -277,6 +279,7 @@ impl Manifest {
                         .post_install
                         .iter()
                         .chain(&component.post_deploy)
+                        .chain(&component.post_reinstall)
                         .filter_map(|hook| {
                             if let HookEntry::Scoped { environments, .. } = hook {
                                 Some(environments)

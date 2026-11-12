@@ -352,10 +352,14 @@ fn local_package_needs_build(pkg_dir: &Path, name: &str) -> Result<bool> {
             "  Checking upstream sources for local package: {}...",
             style(name).cyan()
         );
-        let _ = Command::new("makepkg")
+        let status = Command::new("makepkg")
             .args(["-od", "--noconfirm"])
             .current_dir(pkg_dir)
-            .status();
+            .status()
+            .with_context(|| format!("Could not refresh sources for local:{name}"))?;
+        if !status.success() {
+            bail!("Source refresh failed for local:{name}");
+        }
     }
 
     let updated_info = resolve_local_pkg_info_in_dir(pkg_dir, name);
@@ -463,8 +467,7 @@ fn run_with_interactive_fallback(
         }
 
         if !prompt_package_failure(label)? {
-            println!("  {} Skipping {}...", style("→").dim(), label);
-            return Ok(());
+            bail!("Package step skipped after failure: {label}");
         }
     }
 }
@@ -875,4 +878,49 @@ pub fn missing_specs(specs: &[String], repo: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(missing)
+}
+
+/// Upgrade official packages first; an AUR build failure must not prevent local
+/// recipes/configuration from being processed after a successful repo upgrade.
+pub fn upgrade_system(ignored: &[String]) -> Result<Vec<String>> {
+    ensure_paru()?;
+    let run = |base: &[&str]| -> Result<bool> {
+        let mut command = Command::new("paru");
+        command.args(base);
+        if !ignored.is_empty() {
+            command.args(["--ignore", &ignored.join(",")]);
+        }
+        Ok(command
+            .status()
+            .context("Failed to run system upgrade")?
+            .success())
+    };
+    println!("Updating system packages…");
+    if !run(&["-Syu", "--repo"])? {
+        bail!("Repository upgrade failed; package sync stopped");
+    }
+    println!("Updating AUR packages…");
+    match run(&["-Su", "--aur", "--devel"]) {
+        Ok(true) => Ok(Vec::new()),
+        Ok(false) => Ok(vec!["AUR upgrade failed".into()]),
+        Err(error) => Ok(vec![format!("AUR upgrade: {error:#}")]),
+    }
+}
+
+/// Check one enabled local recipe without replacing an installed accepted variant.
+pub fn update_local_package(spec: &str, repo: &Path) -> Result<()> {
+    let names = names_for_package_audit(spec, repo)?;
+    let installed = installed_package_names()?;
+    if names.iter().any(|name| !installed.contains(name)) {
+        let mut provided = true;
+        for name in &names {
+            if !requirement_satisfied(name, &installed)? {
+                provided = false;
+            }
+        }
+        if provided {
+            return Ok(());
+        }
+    }
+    install_packages(&[spec.to_string()], repo, true)
 }

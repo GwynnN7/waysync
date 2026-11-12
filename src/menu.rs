@@ -110,6 +110,30 @@ enum MenuEntry {
 }
 
 impl MenuEntry {
+    fn hint(&self) -> &str {
+        match self {
+            Self::Group(_, MenuPage::Components) => "Manage installed components",
+            Self::Group(_, MenuPage::Dotfiles) => "Deploy files or capture edits",
+            Self::Group(_, MenuPage::Profile) => "Environment and device",
+            Self::Group(_, MenuPage::Repository) => "Pull changes or check config",
+            Self::Group(_, MenuPage::Home) | Self::Back => "Return to main menu",
+            Self::Action(_, action) => match action {
+                MainMenuAction::ManageComponents => "Full upgrade + apply selection",
+                MainMenuAction::InstallSpecific => "Install selected components",
+                MainMenuAction::UninstallSpecific => "Remove selected components",
+                MainMenuAction::ReinstallPackages => "Rebuild packages; run reload hooks",
+                MainMenuAction::DeployDotfiles => "Copy dotfiles; skip packages",
+                MainMenuAction::CaptureChanges => "Copy local edits to your checkout",
+                MainMenuAction::ChangeEnvironment => "Switch desktop environment",
+                MainMenuAction::ChangeDevice => "Switch desktop / laptop",
+                MainMenuAction::UpdateRepo => "Pull dotfiles repository only",
+                MainMenuAction::Check => "Validate configuration",
+                MainMenuAction::Status => "Show component status",
+                MainMenuAction::Exit => "Return to terminal",
+            },
+        }
+    }
+
     fn icon(&self) -> &str {
         match self {
             Self::Group(_, MenuPage::Components) => "📦",
@@ -260,7 +284,7 @@ fn main_menu_loop(
             .blue()
             .bold(),
         );
-        let range = visible_range(entries.len(), nav.cursor, term.size().0, 8);
+        let range = visible_range(entries.len(), nav.cursor, term.size().0, 9);
         for (index, entry) in entries.iter().enumerate().take(range.end).skip(range.start) {
             let icon_padding =
                 " ".repeat(2usize.saturating_sub(console::measure_text_width(entry.icon())));
@@ -280,8 +304,9 @@ fn main_menu_loop(
                 );
             }
         }
+        println!("\n  {}", style(entries[nav.cursor].hint()).dim());
         println!(
-            "\n  {} {}  ·  {} {}  ·  {} {}",
+            "  {} {}  ·  {} {}  ·  {} {}",
             style("↑/↓").cyan(),
             style("Move").dim(),
             style("Enter").cyan(),
@@ -406,7 +431,7 @@ fn run_components_menu(
                 .filter(|name| !state.is_installed(name))
                 .count();
             println!(
-                "  Install {}  ·  Deploy {}  ·  Remove {}",
+                "  Full upgrade  ·  Install {}  ·  Deploy {}  ·  Remove {}",
                 installs,
                 selection.enabled.len() - installs,
                 removals.len()
@@ -479,7 +504,7 @@ fn components_menu_loop(
         SelectionMode::Declarative => "Manage Components",
         SelectionMode::InstallSpecific => "Install Components",
         SelectionMode::UninstallSpecific => "Uninstall Components",
-        SelectionMode::ReinstallPackages => "Reinstall Packages Only",
+        SelectionMode::ReinstallPackages => "Reinstall Packages",
     };
 
     loop {
