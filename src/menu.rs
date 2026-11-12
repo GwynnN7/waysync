@@ -118,7 +118,7 @@ impl MenuEntry {
             Self::Group(_, MenuPage::Repository) => "🌿",
             Self::Group(_, MenuPage::Home) => "⌂",
             Self::Action(_, action) => match action {
-                MainMenuAction::ManageComponents => "☑",
+                MainMenuAction::ManageComponents => "🎛️",
                 MainMenuAction::InstallSpecific => "📥",
                 MainMenuAction::UninstallSpecific => "🗑",
                 MainMenuAction::ReinstallPackages => "🔧",
@@ -183,10 +183,10 @@ fn page_entries(page: MenuPage, has_environments: bool) -> Vec<MenuEntry> {
             Action("Quit", Exit),
         ],
         MenuPage::Components => vec![
-            Action("Select & apply", ManageComponents),
+            Action("Manage", ManageComponents),
             Action("Install", InstallSpecific),
             Action("Uninstall", UninstallSpecific),
-            Action("Reinstall packages", ReinstallPackages),
+            Action("Reinstall", ReinstallPackages),
             Back,
         ],
         MenuPage::Dotfiles => vec![
@@ -268,11 +268,16 @@ fn main_menu_loop(
             if index == nav.cursor {
                 println!(
                     "  {} {}",
-                    entry.accent().bold().apply_to("▸"),
-                    entry.accent().bold().reverse().apply_to(label)
+                    style("▸").cyan().bold(),
+                    style(label).cyan().bold()
                 );
             } else {
-                println!("    {}", entry.accent().apply_to(label));
+                println!(
+                    "     {}{} {} ",
+                    entry.accent().apply_to(entry.icon()),
+                    icon_padding,
+                    entry.label()
+                );
             }
         }
         println!(
@@ -411,10 +416,9 @@ fn run_components_menu(
             println!("  Install {} components", selection.enabled.len())
         }
         SelectionMode::UninstallSpecific => println!("  Uninstall {} components", removals.len()),
-        SelectionMode::ReinstallPackages => println!(
-            "  Reinstall packages: {} components",
-            selection.enabled.len()
-        ),
+        SelectionMode::ReinstallPackages => {
+            println!("  Reinstall: {} components", selection.enabled.len())
+        }
     }
     if !removals.is_empty() {
         println!(

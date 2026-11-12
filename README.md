@@ -73,7 +73,7 @@ The home menu shows the active environment/device and four groups:
 
 | Menu | Actions |
 | --- | --- |
-| Components | Select & apply, Install, Uninstall, Reinstall packages |
+| Components | Manage, Install, Uninstall, Reinstall |
 | Dotfiles | Deploy, Capture edits |
 | Profile | Environment, Device |
 | Repository | Pull changes, Check |
@@ -87,11 +87,11 @@ Status and Quit are on the home menu. `Esc` or Back returns one level; actions r
 | Components | `Space` toggles one; `a` toggles all matches; `/` filters by name; `Enter` / `Esc` / `h` goes back. |
 | Status | `↑` / `↓` scrolls; `Enter` / `Esc` returns. |
 
-**Components → Select & apply** starts with remembered choices, or `default` for new components. Applying the selection is a system operation, not just a preference save. New selections install packages and files; unchecked installed components are uninstalled; retained selections restore any missing packages and deploy their files without forcing upgrades or rebuilds. The confirmation names the removals.
+**Components → Manage** starts with remembered choices, or `default` for new components. Applying the selection is a system operation, not just a preference save. New selections install packages and files; unchecked installed components are uninstalled; retained selections restore any missing packages and deploy their files without forcing upgrades or rebuilds. The confirmation names the removals.
 
 **Components → Install** offers components Waysync has not installed. **Components → Uninstall** offers tracked installed components. Both perform real system/file changes and update Waysync's tracking. Both change the system; neither is a bookkeeping-only action.
 
-**Components → Reinstall packages** is a separate action for installed components with packages. The old reinstall checkbox is gone: forcing package installation has no purpose in file deployment or uninstall. It does not deploy files, run hooks, or change component choices. **Dotfiles → Deploy** asks whether to run deployment hooks; answer No for file copying only.
+**Components → Reinstall** is a separate action for installed components with packages. The old reinstall checkbox is gone: forcing package installation has no purpose in file deployment or uninstall. It does not deploy files, run hooks, or change component choices. **Dotfiles → Deploy** asks whether to run deployment hooks; answer No for file copying only.
 
 ### Action boundaries
 
@@ -104,7 +104,7 @@ Status and Quit are on the home menu. `Esc` or Back returns one level; actions r
 | Manage → Apply Selection / `sync` | Install new components, restore missing packages, remove deselected ones | Selected components | `post_install` for new installs, then `post_deploy` | Updated to reflect applied selection |
 | Install components | Install missing packages | Selected components | New-install setup, then deployment hooks | Enable and record installation |
 | Uninstall components | Remove packages unclaimed by retained components | Remove unchanged tracked files | None | Disable and clear installation tracking |
-| Reinstall packages | Force reinstall/rebuild | None | None | Unchanged |
+| Reinstall | Force reinstall/rebuild | None | None | Unchanged |
 | Update repository | None | None | None | Unchanged; only the Git checkout changes |
 | Capture local changes | None | Copy deployed edits back into the authoring checkout | None | Remember checkout; deployment baselines and choices unchanged |
 
@@ -171,7 +171,7 @@ References: [PKGBUILD dependency fields](https://man.archlinux.org/man/PKGBUILD.
 
 `sync`, **Manage → Apply Selection**, explicit component installation, and profile changes audit packages for the installed components they reconcile. Waysync reads pacman's installed package list and resolves `local:` recipes in temporary directories so split-package outputs are checked by their actual names. A missing output rebuilds/reinstalls that recipe. Already present package specs are left alone; package database query errors stop the operation rather than triggering a mass reinstall.
 
-Installed providers satisfy requirements through pacman's dependency checks. For this personal setup, unversioned stable/Git counterparts are also accepted in either direction (for example `astra-atlas` / `astra-atlas-git` and `papirus-folders` / `papirus-folders-git`). Sync and first installation preserve the installed choice rather than trying to replace it. Explicit version requirements still use pacman's dependency test; a name ending in `-git` is otherwise a preference, not a demand to replace a working stable installation. Explicit **Reinstall Packages** continues to target the manifest's chosen specs.
+Installed providers satisfy requirements through pacman's dependency checks. For this personal setup, unversioned stable/Git counterparts are also accepted in either direction (for example `astra-atlas` / `astra-atlas-git` and `papirus-folders` / `papirus-folders-git`). Sync and first installation preserve the installed choice rather than trying to replace it. Explicit version requirements still use pacman's dependency test; a name ending in `-git` is otherwise a preference, not a demand to replace a working stable installation. Explicit **Reinstall** continues to target the manifest's chosen specs.
 
 A failed package build/install is reported and skipped so the remaining packages/components can run. Interactive failure choices default to Skip, with Retry available. Noninteractive failures are recorded without waiting for input. A failed component is not recorded as successfully installed; its selection remains enabled for a later sync retry. For an already managed component with a failed missing-package repair, its files and hooks are deferred until the repair succeeds. The final summary lists failures and exits nonzero after remaining work has completed. Package database/query errors and invalid configuration still stop before making unsafe assumptions.
 
@@ -278,7 +278,7 @@ Legacy `environment = "name"`, `shell = "name"`, and `[shells]` remain accepted.
 
 - `post_install` runs after files are deployed when a component is newly installed or reactivated. A failed installation hook is retried on the next sync.
 - `post_deploy` runs after every deployment of that component.
-- Retained components on a profile switch run only applicable `post_deploy` hooks. Use these for environment/device activation work; `post_install` is reserved for installing or reactivating a component. Reinstall Packages does not invoke either hook phase.
+- Retained components on a profile switch run only applicable `post_deploy` hooks. Use these for environment/device activation work; `post_install` is reserved for installing or reactivating a component. Reinstall does not invoke either hook phase.
 - Hooks run through `sh -c` from the repository root, with `WAYSYNC_REPO_DIR`, `WAYSYNC_ENV`, and `WAYSYNC_DEVICE` set. Unset axes are empty strings.
 - A failed hook stops that component and reports the failure. Component reconciliation continues with other components and summarizes errors afterward. For deliberately optional commands, handle the expected failure explicitly, for example `hyprctl reload || true` when running outside a session.
 - `src = "repo:owner/project"` clones a GitHub repository into `dest` or pulls an existing checkout. It bypasses override layers, does not support `sudo`, and the checkout is preserved on uninstall to protect user work.
