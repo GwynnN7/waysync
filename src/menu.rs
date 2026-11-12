@@ -61,10 +61,7 @@ pub fn render_header(term: &Term, subtitle: &str) -> Result<()> {
 /// Wait for the user to press Enter/Space/Esc before clearing the screen again.
 pub fn wait_for_enter() -> Result<()> {
     let term = Term::stdout();
-    println!(
-        "\n  {}",
-        style("Press Enter to return to the menu...").dim()
-    );
+    println!("\n  {}", style("Enter to return").dim());
     loop {
         match term.read_key()? {
             Key::Enter | Key::Escape | Key::Char(' ') | Key::Char('q') => break,
@@ -81,59 +78,117 @@ pub fn confirm_component_update(component: &str) -> Result<bool> {
         return Ok(false);
     }
     Confirm::new()
-        .with_prompt(format!("Update optional component '{}' now?", component))
+        .with_prompt(format!("Update '{}'?", component))
         .default(false)
         .interact()
         .map_err(Into::into)
 }
 
-/// Interactive Main Menu.
-pub fn show_main_menu(manifest: &Manifest, profile: Profile<'_>) -> Result<MainMenuAction> {
+#[derive(Clone, Copy, Default)]
+enum MenuPage {
+    #[default]
+    Home,
+    Components,
+    Dotfiles,
+    Profile,
+    Repository,
+}
+
+#[derive(Default)]
+pub struct Navigation {
+    page: MenuPage,
+    cursor: usize,
+    home_cursor: usize,
+}
+
+enum MenuEntry {
+    Group(&'static str, MenuPage),
+    Action(&'static str, MainMenuAction),
+    Back,
+}
+
+impl MenuEntry {
+    fn label(&self) -> &str {
+        match self {
+            Self::Group(label, _) | Self::Action(label, _) => label,
+            Self::Back => "Back",
+        }
+    }
+}
+
+fn page_entries(page: MenuPage, has_environments: bool) -> Vec<MenuEntry> {
+    use MainMenuAction::*;
+    use MenuEntry::{Action, Back, Group};
+    match page {
+        MenuPage::Home => vec![
+            Group("Components ›", MenuPage::Components),
+            Group("Dotfiles ›", MenuPage::Dotfiles),
+            Group("Profile ›", MenuPage::Profile),
+            Group("Repository ›", MenuPage::Repository),
+            Action("Status", Status),
+            Action("Quit", Exit),
+        ],
+        MenuPage::Components => vec![
+            Action("Select & apply", ManageComponents),
+            Action("Install", InstallSpecific),
+            Action("Uninstall", UninstallSpecific),
+            Action("Reinstall packages", ReinstallPackages),
+            Back,
+        ],
+        MenuPage::Dotfiles => vec![
+            Action("Deploy", DeployDotfiles),
+            Action("Capture edits", CaptureChanges),
+            Back,
+        ],
+        MenuPage::Profile => {
+            let mut entries = Vec::new();
+            if has_environments {
+                entries.push(Action("Environment", ChangeEnvironment));
+            }
+            entries.extend([Action("Device", ChangeDevice), Back]);
+            entries
+        }
+        MenuPage::Repository => vec![
+            Action("Pull changes", UpdateRepo),
+            Action("Check", Check),
+            Back,
+        ],
+    }
+}
+
+pub fn show_main_menu(
+    manifest: &Manifest,
+    profile: Profile<'_>,
+    navigation: &mut Navigation,
+) -> Result<MainMenuAction> {
     let term = Term::stdout();
     let _ = term.hide_cursor();
-    let res = main_menu_loop(&term, manifest, profile);
+    let result = main_menu_loop(&term, manifest, profile, navigation);
     let _ = term.show_cursor();
-    res
+    result
 }
 
 fn main_menu_loop(
     term: &Term,
     manifest: &Manifest,
     profile: Profile<'_>,
+    nav: &mut Navigation,
 ) -> Result<MainMenuAction> {
-    let has_envs = !manifest.available_environments().is_empty();
-
-    let mut entries: Vec<(&str, MainMenuAction)> = vec![
-        ("📦 Manage Components", MainMenuAction::ManageComponents),
-        ("📄 Deploy Dotfiles", MainMenuAction::DeployDotfiles),
-        ("📥 Capture Local Changes", MainMenuAction::CaptureChanges),
-        ("⚡ Install Components", MainMenuAction::InstallSpecific),
-        ("🗑️ Uninstall Components", MainMenuAction::UninstallSpecific),
-    ];
-    entries.push(("🔧 Reinstall Packages", MainMenuAction::ReinstallPackages));
-    if has_envs {
-        entries.push(("🖥️ Change Environment", MainMenuAction::ChangeEnvironment));
-    }
-    entries.push(("💻 Change Device", MainMenuAction::ChangeDevice));
-    entries.extend_from_slice(&[
-        ("🔎 Check Configuration", MainMenuAction::Check),
-        ("🔄 Update Repository", MainMenuAction::UpdateRepo),
-        ("📊 Status", MainMenuAction::Status),
-        ("🚪 Exit", MainMenuAction::Exit),
-    ]);
-
-    let mut cursor = 0;
-
     loop {
-        render_header(term, "Main Menu")?;
-
-        if has_envs {
-            let env_label = profile.environment.unwrap_or("none");
-            println!("  Environment: {}\n", style(env_label).cyan().bold());
-        }
-
+        let entries = page_entries(nav.page, !manifest.available_environments().is_empty());
+        nav.cursor = nav.cursor.min(entries.len() - 1);
+        let home = matches!(nav.page, MenuPage::Home);
+        let title = match nav.page {
+            MenuPage::Home => "Main Menu",
+            MenuPage::Components => "Components",
+            MenuPage::Dotfiles => "Dotfiles",
+            MenuPage::Profile => "Profile",
+            MenuPage::Repository => "Repository",
+        };
+        render_header(term, title)?;
         println!(
-            "  Device: {}\n",
+            "  {} / {}\n",
+            style(profile.environment.unwrap_or("none")).cyan(),
             style(
                 profile
                     .device
@@ -141,74 +196,56 @@ fn main_menu_loop(
                     .unwrap_or_else(|| "none".into())
             )
             .cyan()
-            .bold()
         );
-
-        let range = visible_range(entries.len(), cursor, term.size().0, 11);
-        for (i, (label, _)) in entries.iter().enumerate().take(range.end).skip(range.start) {
-            let prefix = if i == cursor {
-                style("❯").cyan().bold()
+        let range = visible_range(entries.len(), nav.cursor, term.size().0, 8);
+        for (index, entry) in entries.iter().enumerate().take(range.end).skip(range.start) {
+            if index == nav.cursor {
+                println!(
+                    "  {} {}",
+                    style("❯").cyan(),
+                    style(entry.label()).cyan().bold()
+                );
             } else {
-                style(" ").dim()
-            };
-            let styled_label = if i == cursor {
-                style(*label).cyan().bold()
-            } else {
-                style(*label)
-            };
-            println!("  {} {}", prefix, styled_label);
+                println!("    {}", entry.label());
+            }
         }
-
-        let description = match entries[cursor].1 {
-            MainMenuAction::ManageComponents => {
-                "Apply selection: install new, restore missing packages, remove unchecked, deploy files."
-            }
-            MainMenuAction::DeployDotfiles => {
-                "Copy files for installed components; choose whether to run deployment hooks."
-            }
-            MainMenuAction::CaptureChanges => "Review deployed edits from ask=true components and copy them into your Git checkout.",
-            MainMenuAction::InstallSpecific => {
-                "Install packages + files, run setup hooks, and enable selected components."
-            }
-            MainMenuAction::UninstallSpecific => {
-                "Remove unshared packages + managed files and disable selected components."
-            }
-            MainMenuAction::ReinstallPackages => {
-                "Force package reinstall/builds only. No files, hooks, or selection changes."
-            }
-            MainMenuAction::UpdateRepo => "Pull Git changes only. Deploy or apply separately.",
-            MainMenuAction::ChangeEnvironment | MainMenuAction::ChangeDevice => {
-                "Switch one profile axis and apply only affected components."
-            }
-            MainMenuAction::Check => {
-                "Validate local inputs without hooks, package managers, or network access."
-            }
-            MainMenuAction::Status => {
-                "Show Waysync tracking; does not scan external package installations."
-            }
-            MainMenuAction::Exit => "Return to the terminal.",
-        };
-        println!("\n  {}", style(description).dim());
         println!(
-            "  {}",
-            style("↑/↓: Navigate  •  Enter: Select  •  q/Esc: Exit").dim()
+            "\n  {}",
+            style(if home {
+                "↑/↓ Move  ·  Enter Select  ·  Esc Quit"
+            } else {
+                "↑/↓ Move  ·  Enter Select  ·  Esc Back"
+            })
+            .dim()
         );
-
         match term.read_key()? {
             Key::ArrowUp | Key::Char('k') => {
-                cursor = if cursor == 0 {
+                nav.cursor = if nav.cursor == 0 {
                     entries.len() - 1
                 } else {
-                    cursor - 1
-                };
+                    nav.cursor - 1
+                }
             }
-            Key::ArrowDown | Key::Char('j') => {
-                cursor = (cursor + 1) % entries.len();
+            Key::ArrowDown | Key::Char('j') => nav.cursor = (nav.cursor + 1) % entries.len(),
+            Key::Enter | Key::ArrowRight | Key::Char('l') => match entries[nav.cursor] {
+                MenuEntry::Action(_, action) => return Ok(action),
+                MenuEntry::Group(_, page) => {
+                    nav.home_cursor = nav.cursor;
+                    nav.page = page;
+                    nav.cursor = 0;
+                }
+                MenuEntry::Back => {
+                    nav.page = MenuPage::Home;
+                    nav.cursor = nav.home_cursor;
+                }
+            },
+            Key::Escape | Key::ArrowLeft | Key::Char('h') | Key::Char('q') => {
+                if home {
+                    return Ok(MainMenuAction::Exit);
+                }
+                nav.page = MenuPage::Home;
+                nav.cursor = nav.home_cursor;
             }
-            Key::Enter | Key::ArrowRight | Key::Char('l') => {
-                return Ok(entries[cursor].1);
-            }
-            Key::Escape | Key::Char('q') => return Ok(MainMenuAction::Exit),
             _ => {}
         }
     }
@@ -247,9 +284,8 @@ pub fn show_reinstall_menu(
 
 pub fn capture_checkout(current: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
     render_header(&Term::stdout(), "Capture Local Changes")?;
-    println!("  Copy deployed edits from ask=true components into your authoring Git checkout.\n  Files are reviewed before copying. Nothing is committed or pushed.\n");
     let input = Input::<String>::new()
-        .with_prompt("Authoring dotfiles checkout (e.g. ~/Projects/dotfiles)")
+        .with_prompt("Dotfiles checkout")
         .with_initial_text(
             current
                 .map(|path| path.to_string_lossy().into_owned())
@@ -261,7 +297,7 @@ pub fn capture_checkout(current: Option<&std::path::Path>) -> Result<std::path::
 
 pub fn confirm_deploy_hooks() -> Result<bool> {
     Confirm::new()
-        .with_prompt("Run post_deploy hooks after copying files? (No skips all hooks)")
+        .with_prompt("Run deployment hooks?")
         .default(true)
         .interact()
         .map_err(Into::into)
@@ -291,11 +327,29 @@ fn run_components_menu(
         .filter(|name| state.is_installed(name))
         .collect();
     term.clear_screen()?;
-    println!(
-        "  Select {} component(s) for this action; remove {} installed component(s).",
-        selection.enabled.len(),
-        removals.len()
-    );
+    match mode {
+        SelectionMode::Declarative => {
+            let installs = selection
+                .enabled
+                .iter()
+                .filter(|name| !state.is_installed(name))
+                .count();
+            println!(
+                "  Install {}  ·  Deploy {}  ·  Remove {}",
+                installs,
+                selection.enabled.len() - installs,
+                removals.len()
+            );
+        }
+        SelectionMode::InstallSpecific => {
+            println!("  Install {} components", selection.enabled.len())
+        }
+        SelectionMode::UninstallSpecific => println!("  Uninstall {} components", removals.len()),
+        SelectionMode::ReinstallPackages => println!(
+            "  Reinstall packages: {} components",
+            selection.enabled.len()
+        ),
+    }
     if !removals.is_empty() {
         println!(
             "  Remove: {}",
@@ -306,14 +360,8 @@ fn run_components_menu(
                 .join(", ")
         );
     }
-    match mode {
-        SelectionMode::Declarative => println!("  New: install packages/files. Managed: restore missing packages and deploy. Unchecked: uninstall."),
-        SelectionMode::InstallSpecific => println!("  Install packages and files, run install/deploy hooks, and enable tracking."),
-        SelectionMode::UninstallSpecific => println!("  Remove unshared packages and unchanged managed files, then disable tracking."),
-        SelectionMode::ReinstallPackages => println!("  Force package installation/builds only. Files, hooks, and component selection stay unchanged."),
-    }
     if Confirm::new()
-        .with_prompt("Apply this selection?")
+        .with_prompt("Apply?")
         .default(removals.is_empty())
         .interact()?
     {
@@ -1037,8 +1085,8 @@ pub fn with_visible_output(term: &Term, operation: impl FnOnce() -> Result<()>) 
     let _ = term.show_cursor();
     term.flush()?;
     match operation() {
-        Ok(()) => println!("\n  Finished. Review the output above."),
-        Err(error) => eprintln!("\n  Operation failed: {error:#}\n  Review the diagnostics before retrying this action. Completed work remains applied."),
+        Ok(()) => {}
+        Err(error) => eprintln!("\nError: {error:#}"),
     }
     wait_for_enter()?;
     print!("\x1b[?1049h");

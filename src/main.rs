@@ -140,7 +140,7 @@ fn main() -> Result<()> {
             ensure_initialized(&config)?;
             repo::pull_repo(&config.repo_dir)?;
             Manifest::load(&config.manifest_path())?;
-            println!("Repository updated. Use 'waysync deploy' for dotfiles or 'waysync sync' to reconcile components.");
+            println!("Repository updated.");
             Ok(())
         }
         Some(Commands::Deploy {
@@ -329,8 +329,9 @@ fn cmd_interactive(config: &AppConfig) -> Result<()> {
     let (mut manifest, mut state) = load(config)?;
     let term = console::Term::stdout();
     let _screen = menu::ScreenGuard::enter(&term)?;
+    let mut navigation = menu::Navigation::default();
     loop {
-        let action = menu::show_main_menu(&manifest, state.profile())?;
+        let action = menu::show_main_menu(&manifest, state.profile(), &mut navigation)?;
         if matches!(action, MainMenuAction::Exit) {
             break;
         }
@@ -433,7 +434,7 @@ fn cmd_interactive(config: &AppConfig) -> Result<()> {
                 menu::with_visible_output(&term, || {
                     repo::pull_repo(&config.repo_dir)?;
                     manifest = Manifest::load(&config.manifest_path())?;
-                    println!("Repository refreshed. Deploy Dotfiles or Manage Components to apply its contents.");
+                    println!("Repository updated.");
                     Ok(())
                 })?;
             }

@@ -480,7 +480,9 @@ fn capture_cli_remembers_authoring_checkout_and_leaves_git_and_deployment_state_
         .output()
         .unwrap();
     assert!(output.stdout.is_empty(), "Capture must not stage changes");
-    assert!(run(root.path(), &["capture", "--yes"]).status.success());
+    let unchanged = run(root.path(), &["capture", "--yes"]);
+    assert!(unchanged.status.success());
+    assert_eq!(String::from_utf8_lossy(&unchanged.stdout), "No changes.\n");
 }
 
 #[test]

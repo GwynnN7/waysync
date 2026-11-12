@@ -69,7 +69,16 @@ Opening the menu does **not** pull or modify the checkout. Repository updates ne
 
 ### Terminal UI
 
-The main menu shows the active environment and device. Component and category lists scroll to keep the selected row visible.
+The home menu shows the active environment/device and four groups:
+
+| Menu | Actions |
+| --- | --- |
+| Components | Select & apply, Install, Uninstall, Reinstall packages |
+| Dotfiles | Deploy, Capture edits |
+| Profile | Environment, Device |
+| Repository | Pull changes, Check |
+
+Status and Quit are on the home menu. `Esc` or Back returns one level; actions return to the same submenu and selection. Long component/category lists scroll to keep the selected row visible. Routine output is brief: capture shows `No changes.` or `Captured 3 files.`; diffs and errors appear when relevant.
 
 | View | Keys |
 | --- | --- |
@@ -78,11 +87,11 @@ The main menu shows the active environment and device. Component and category li
 | Components | `Space` toggles one; `a` toggles all matches; `/` filters by name; `Enter` / `Esc` / `h` goes back. |
 | Status | `↑` / `↓` scrolls; `Enter` / `Esc` returns. |
 
-**Manage Components** starts with remembered choices, or `default` for new components. **Apply Selection** is a system operation, not just a preference save. New selections install packages and files; unchecked installed components are uninstalled; retained selections restore any missing packages and deploy their files without forcing upgrades or rebuilds. The confirmation names the removals.
+**Components → Select & apply** starts with remembered choices, or `default` for new components. Applying the selection is a system operation, not just a preference save. New selections install packages and files; unchecked installed components are uninstalled; retained selections restore any missing packages and deploy their files without forcing upgrades or rebuilds. The confirmation names the removals.
 
-**Install Components** offers components Waysync has not installed. **Uninstall Components** offers tracked installed components. Both perform real system/file changes and update Waysync's tracking. Both change the system; neither is a bookkeeping-only action.
+**Components → Install** offers components Waysync has not installed. **Components → Uninstall** offers tracked installed components. Both perform real system/file changes and update Waysync's tracking. Both change the system; neither is a bookkeeping-only action.
 
-**Reinstall Packages** is a separate action for installed components with packages. The old reinstall checkbox is gone: forcing package installation has no purpose in file deployment or uninstall. It does not deploy files, run hooks, or change component choices. The Deploy Dotfiles action asks whether to run deployment hooks; answer No for file copying only.
+**Components → Reinstall packages** is a separate action for installed components with packages. The old reinstall checkbox is gone: forcing package installation has no purpose in file deployment or uninstall. It does not deploy files, run hooks, or change component choices. **Dotfiles → Deploy** asks whether to run deployment hooks; answer No for file copying only.
 
 ### Action boundaries
 

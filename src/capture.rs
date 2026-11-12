@@ -130,7 +130,6 @@ fn plan_capture(
                     "No file entry matches this deployed path in the active manifest/profile",
                 )?;
                 let FileSource::Local(current_source) = &current.source else {
-                    println!("  Skipping external Git checkout: {}", deployed.display());
                     return Ok(None);
                 };
                 let Some(baseline) = state.hashes.get(key) else {
@@ -202,14 +201,9 @@ fn plan_capture(
 
 fn show_change(change: &Change) {
     println!(
-        "\n  {} → {}{}",
-        change.deployed.display(),
-        change.source.display(),
-        if change.conflict {
-            " [checkout also changed]"
-        } else {
-            ""
-        }
+        "\n  {}{}",
+        change.relative.display(),
+        if change.conflict { " [conflict]" } else { "" }
     );
     if let (Ok(old), Ok(new)) = (
         std::str::from_utf8(&change.checkout),
@@ -268,7 +262,6 @@ pub fn run(
     let checkout = checkout.or(state.working_repo.as_deref())
         .context("Choose an authoring checkout: waysync capture --repo ~/Projects/dotfiles (the path is remembered)")?;
     let plan = plan_capture(config, manifest, state, checkout)?;
-    println!("Authoring checkout: {}\n{} changed file(s) in deployed ask=true components; {} skipped path(s).", plan.root.display(), plan.changes.len(), plan.skipped);
     // Don't start copying and only then discover there is no terminal for approval.
     if !options.dry_run
         && !options.yes
@@ -293,9 +286,9 @@ pub fn run(
         } else {
             Confirm::new()
                 .with_prompt(if change.conflict {
-                    "Both versions changed. Overwrite the checkout file with this deployed edit?"
+                    "Overwrite checkout changes?"
                 } else {
-                    "Copy this deployed edit into the checkout?"
+                    "Copy to checkout?"
                 })
                 .default(!change.conflict)
                 .interact()?
@@ -308,13 +301,27 @@ pub fn run(
         copy_change(&plan.root, change)?;
         copied += 1;
     }
-    if options.dry_run {
-        println!("Dry run: no files or state changed.");
+    if plan.changes.is_empty() && skipped == 0 {
+        println!("No changes.");
+    } else if options.dry_run {
+        println!(
+            "{} changed file{} (dry run).",
+            plan.changes.len(),
+            if plan.changes.len() == 1 { "" } else { "s" }
+        );
+    } else if copied == 0 {
+        println!("No files captured.");
     } else {
-        println!("Captured {copied} file(s); skipped {skipped}. Review with git -C '{}' diff. Nothing was staged, committed, or pushed.", plan.root.display());
+        println!(
+            "Captured {copied} file{}.",
+            if copied == 1 { "" } else { "s" }
+        );
     }
     if skipped > 0 {
-        bail!("Some paths were skipped; review the diagnostics above");
+        println!("{skipped} skipped.");
+    }
+    if skipped > 0 {
+        bail!("Some files were skipped");
     }
     Ok(())
 }
