@@ -791,3 +791,74 @@ fn capture_uses_sudo_read_without_unprivileged_stat_of_protected_parent() {
         "deployed edit"
     );
 }
+
+#[test]
+fn privileged_copy_uses_real_mktemp_correctly_and_reports_its_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("data/waysync/repo");
+    let tools = root.path().join("tools");
+    let fail = root.path().join("fail-mktemp");
+    fs::create_dir_all(repo.join("dotfiles")).unwrap();
+    fs::create_dir_all(&tools).unwrap();
+    fs::write(repo.join("dotfiles/script"), "#!/bin/sh\nprintf hello\\n\n").unwrap();
+    fs::set_permissions(
+        repo.join("dotfiles/script"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(repo.join("manifest.toml"), "[[components]]\nname='privileged'\n[[components.files]]\nsrc='script'\ndest='$XDG_CONFIG_HOME/folder with spaces/script'\nsudo=true\n").unwrap();
+    let sudo = tools.join("sudo");
+    // No privilege escalation in this test. Execute real coreutils in the temp tree.
+    fs::write(
+        &sudo,
+        format!(
+            r#"#!/bin/sh
+[ "$1" = -v ] && exit 0
+cmd="$1"; shift
+if [ "$cmd" = mktemp ] && [ -f '{}' ]; then printf 'test allocation denied\n' >&2; exit 1; fi
+exec "/usr/bin/$cmd" "$@"
+"#,
+            fail.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(sudo, fs::Permissions::from_mode(0o755)).unwrap();
+    let invoke = || {
+        Command::new(env!("CARGO_BIN_EXE_waysync"))
+            .args(["install", "privileged"])
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("PATH", &tools)
+            .output()
+            .unwrap()
+    };
+    let output = invoke();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dest = root.path().join("config/folder with spaces/script");
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        fs::read(repo.join("dotfiles/script")).unwrap()
+    );
+    assert_eq!(
+        fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::read_dir(dest.parent().unwrap()).unwrap().count(),
+        1,
+        "Temporary files must not remain"
+    );
+    fs::write(&fail, "fail").unwrap();
+    fs::write(repo.join("dotfiles/script"), "updated script").unwrap();
+    let output = invoke();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("test allocation denied"));
+    assert_ne!(fs::read_to_string(dest).unwrap(), "updated script");
+}

@@ -4,7 +4,7 @@ Waysync manages dotfiles and packages on Arch-based Linux systems. Choose the co
 
 - Merge shared, environment, device, and device-plus-environment files.
 - Install native, AUR (`aur:`), and local `PKGBUILD` (`local:`) packages.
-- Review local file conflicts with a diff before overwriting them.
+- Review local file conflicts with a colored diff before overwriting them.
 - Capture edits from deployed `ask = true` components back into your authoring checkout.
 - Restore manually removed managed packages on the next sync.
 - Check a repository without installing packages, running hooks, or changing files.
@@ -281,6 +281,7 @@ Legacy `environment = "name"`, `shell = "name"`, and `[shells]` remain accepted.
 - Retained components on a profile switch run only applicable `post_deploy` hooks. Use these for environment/device activation work; `post_install` is reserved for installing or reactivating a component. Reinstall does not invoke either hook phase.
 - Hooks run through `sh -c` from the repository root, with `WAYSYNC_REPO_DIR`, `WAYSYNC_ENV`, and `WAYSYNC_DEVICE` set. Unset axes are empty strings.
 - A failed hook stops that component and reports the failure. Component reconciliation continues with other components and summarizes errors afterward. For deliberately optional commands, handle the expected failure explicitly, for example `hyprctl reload || true` when running outside a session.
+- Optional reloads should handle an inactive app explicitly, for example `killall -USR2 btop 2>/dev/null || true`.
 - `src = "repo:owner/project"` clones a GitHub repository into `dest` or pulls an existing checkout. It bypasses override layers, does not support `sudo`, and the checkout is preserved on uninstall to protect user work.
 
 In TOML, keys after `[[components.files]]` belong to that file table until another table starts. Put component hooks before the first file table. `check` reports ignored keys and misplaced hooks and exits nonzero for any finding.

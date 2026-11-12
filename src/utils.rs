@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use console::style;
 use sha2::{Digest, Sha256};
+use similar::TextDiff;
 use walkdir::WalkDir;
 
 use crate::config::AppConfig;
@@ -237,13 +239,18 @@ pub fn copy_file(src: &Path, dest: &Path, sudo: bool) -> Result<()> {
         run_cmd("sudo", &["mkdir", "-p", "--", &parent.to_string_lossy()])?;
         // Allocate securely rather than using a predictable PID-based filename.
         let output = Command::new("sudo")
-            .args(["mktemp", "--tmpdir"])
+            .args(["mktemp", "-p"])
             .arg(parent)
             .arg(".waysync-XXXXXXXXXX")
             .output()
             .context("Failed to allocate privileged temporary file")?;
         if !output.status.success() {
-            bail!("sudo mktemp failed in {}", parent.display());
+            bail!(
+                "sudo mktemp failed in {} ({}): {}",
+                parent.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         let temp = PathBuf::from(String::from_utf8(output.stdout)?.trim());
         let result = (|| -> Result<()> {
@@ -534,5 +541,34 @@ mod path_tests {
         ] {
             assert!(destination_path(value).is_err(), "Should reject {value}");
         }
+    }
+}
+
+/// Shared diff renderer for deployment conflicts and captured edits. Color is
+/// terminal-aware; prefixes still make redirected/no-color output readable.
+pub fn print_text_diff(old: &str, new: &str, old_label: &str, new_label: &str) {
+    let diff = TextDiff::from_lines(old, new);
+    let unified = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(old_label, new_label)
+        .to_string();
+    for line in unified.split_inclusive('\n') {
+        let text = if line.starts_with("---") {
+            style(line).red().bold()
+        } else if line.starts_with("+++") {
+            style(line).green().bold()
+        } else if line.starts_with('+') {
+            style(line).green()
+        } else if line.starts_with('-') {
+            style(line).red()
+        } else if line.starts_with("@@") {
+            style(line).cyan().bold()
+        } else if line.starts_with('\\') {
+            style(line).yellow()
+        } else {
+            style(line)
+        };
+        print!("{text}");
     }
 }

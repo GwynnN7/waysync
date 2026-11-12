@@ -4,15 +4,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use console::style;
 use dialoguer::Select;
-use similar::TextDiff;
 
 use crate::config::AppConfig;
 use crate::manifest::{Component, FileEntry, Manifest};
 use crate::profile::Profile;
 use crate::state::State;
 use crate::utils::{
-    collect_directory_files, copy_file, destination_path, hash_contents, read_file_contents,
-    remove_path, resolve_file_source, FileSource,
+    collect_directory_files, copy_file, destination_path, hash_contents, print_text_diff,
+    read_file_contents, remove_path, resolve_file_source, FileSource,
 };
 
 pub struct PlannedFile<'a> {
@@ -252,13 +251,7 @@ fn deploy_single_file_with_choice(
             if let (Ok(local), Ok(incoming)) =
                 (std::str::from_utf8(&local), std::str::from_utf8(&incoming))
             {
-                let diff = TextDiff::from_lines(local, incoming);
-                print!(
-                    "{}",
-                    diff.unified_diff()
-                        .context_radius(3)
-                        .header("local", "incoming")
-                );
+                print_text_diff(local, incoming, "local", "incoming");
             } else {
                 println!(
                     "  Binary content differs ({} local / {} incoming bytes).",

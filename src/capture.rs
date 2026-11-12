@@ -4,12 +4,11 @@ use std::path::{Component as PathComponent, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use dialoguer::Confirm;
-use similar::TextDiff;
 
 use crate::config::AppConfig;
 use crate::manifest::Manifest;
 use crate::state::State;
-use crate::utils::{hash_contents, read_file_contents, FileSource};
+use crate::utils::{hash_contents, print_text_diff, read_file_contents, FileSource};
 
 #[derive(Default)]
 pub struct CaptureOptions {
@@ -209,13 +208,7 @@ fn show_change(change: &Change) {
         std::str::from_utf8(&change.checkout),
         std::str::from_utf8(&change.local),
     ) {
-        print!(
-            "{}",
-            TextDiff::from_lines(old, new)
-                .unified_diff()
-                .context_radius(3)
-                .header("checkout", "deployed edit")
-        );
+        print_text_diff(old, new, "checkout", "deployed edit");
     } else {
         println!(
             "  Binary content differs: {} checkout bytes / {} deployed bytes",
