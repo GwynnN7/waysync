@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 
 use crate::profile::{Device, Profile};
 use anyhow::Result;
-use console::{style, Key, Term};
+use console::{style, Key, Style, Term};
 use dialoguer::{Confirm, Input};
 
 use crate::manifest::{Component, Manifest};
@@ -48,12 +48,14 @@ pub fn render_header(term: &Term, subtitle: &str) -> Result<()> {
     term.flush()?;
     println!(
         "  {} {}",
-        style("waysync").cyan().bold(),
-        style(format!("── {}", subtitle)).dim()
+        style("◆ waysync").cyan().bold(),
+        style(format!("── {}", subtitle)).bold()
     );
     println!(
         "  {}\n",
-        style("────────────────────────────────────────────────────────").dim()
+        style("─".repeat(usize::from(term.size().1).saturating_sub(4).clamp(8, 56)))
+            .cyan()
+            .dim()
     );
     Ok(())
 }
@@ -108,6 +110,58 @@ enum MenuEntry {
 }
 
 impl MenuEntry {
+    fn icon(&self) -> &str {
+        match self {
+            Self::Group(_, MenuPage::Components) => "📦",
+            Self::Group(_, MenuPage::Dotfiles) => "📄",
+            Self::Group(_, MenuPage::Profile) => "🎨",
+            Self::Group(_, MenuPage::Repository) => "🌿",
+            Self::Group(_, MenuPage::Home) => "⌂",
+            Self::Action(_, action) => match action {
+                MainMenuAction::ManageComponents => "☑",
+                MainMenuAction::InstallSpecific => "📥",
+                MainMenuAction::UninstallSpecific => "🗑",
+                MainMenuAction::ReinstallPackages => "🔧",
+                MainMenuAction::DeployDotfiles => "📤",
+                MainMenuAction::CaptureChanges => "📸",
+                MainMenuAction::ChangeEnvironment => "🎨",
+                MainMenuAction::ChangeDevice => "💻",
+                MainMenuAction::UpdateRepo => "🔄",
+                MainMenuAction::Check => "🔎",
+                MainMenuAction::Status => "📊",
+                MainMenuAction::Exit => "🚪",
+            },
+            Self::Back => "↩",
+        }
+    }
+
+    fn accent(&self) -> Style {
+        match self {
+            Self::Group(_, MenuPage::Components)
+            | Self::Action(_, MainMenuAction::ManageComponents) => Style::new().cyan(),
+            Self::Group(_, MenuPage::Dotfiles)
+            | Self::Action(_, MainMenuAction::DeployDotfiles | MainMenuAction::CaptureChanges) => {
+                Style::new().blue()
+            }
+            Self::Group(_, MenuPage::Profile)
+            | Self::Action(_, MainMenuAction::ChangeEnvironment | MainMenuAction::ChangeDevice) => {
+                Style::new().magenta()
+            }
+            Self::Group(_, MenuPage::Repository)
+            | Self::Action(_, MainMenuAction::UpdateRepo | MainMenuAction::ReinstallPackages) => {
+                Style::new().yellow()
+            }
+            Self::Action(
+                _,
+                MainMenuAction::InstallSpecific | MainMenuAction::Check | MainMenuAction::Status,
+            ) => Style::new().green(),
+            Self::Action(_, MainMenuAction::UninstallSpecific | MainMenuAction::Exit) => {
+                Style::new().red()
+            }
+            Self::Back | Self::Group(_, MenuPage::Home) => Style::new().dim(),
+        }
+    }
+
     fn label(&self) -> &str {
         match self {
             Self::Group(label, _) | Self::Action(label, _) => label,
@@ -186,37 +240,49 @@ fn main_menu_loop(
             MenuPage::Repository => "Repository",
         };
         render_header(term, title)?;
+        let device_icon = match profile.device {
+            Some(Device::Desktop) => "🖥",
+            Some(Device::Laptop) => "💻",
+            None => "◌",
+        };
         println!(
-            "  {} / {}\n",
-            style(profile.environment.unwrap_or("none")).cyan(),
+            "  🎨 {}   {} {}\n",
+            style(profile.environment.unwrap_or("none"))
+                .magenta()
+                .bold(),
+            device_icon,
             style(
                 profile
                     .device
                     .map(|device| device.to_string())
                     .unwrap_or_else(|| "none".into())
             )
-            .cyan()
+            .blue()
+            .bold(),
         );
         let range = visible_range(entries.len(), nav.cursor, term.size().0, 8);
         for (index, entry) in entries.iter().enumerate().take(range.end).skip(range.start) {
+            let icon_padding =
+                " ".repeat(2usize.saturating_sub(console::measure_text_width(entry.icon())));
+            let label = format!(" {}{} {} ", entry.icon(), icon_padding, entry.label());
             if index == nav.cursor {
                 println!(
                     "  {} {}",
-                    style("❯").cyan(),
-                    style(entry.label()).cyan().bold()
+                    entry.accent().bold().apply_to("▸"),
+                    entry.accent().bold().reverse().apply_to(label)
                 );
             } else {
-                println!("    {}", entry.label());
+                println!("    {}", entry.accent().apply_to(label));
             }
         }
         println!(
-            "\n  {}",
-            style(if home {
-                "↑/↓ Move  ·  Enter Select  ·  Esc Quit"
-            } else {
-                "↑/↓ Move  ·  Enter Select  ·  Esc Back"
-            })
-            .dim()
+            "\n  {} {}  ·  {} {}  ·  {} {}",
+            style("↑/↓").cyan(),
+            style("Move").dim(),
+            style("Enter").cyan(),
+            style("Select").dim(),
+            style("Esc").cyan(),
+            style(if home { "Quit" } else { "Back" }).dim(),
         );
         match term.read_key()? {
             Key::ArrowUp | Key::Char('k') => {
